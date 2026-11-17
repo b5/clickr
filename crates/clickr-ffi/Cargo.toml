@@ -1,0 +1,16 @@
+[package]
+name = "clickr-ffi"
+description = "Swift bindings for clickr-core, used by the iOS app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# `staticlib` is linked into the iOS app, `cdylib` is read by uniffi-bindgen to
+# generate the Swift sources.
+crate-type = ["staticlib", "cdylib", "lib"]
+name = "clickr_ffi"
+
+[dependencies]
+clickr-core.workspace = true
+uniffi = { version = "0.32", features = ["tokio"] }

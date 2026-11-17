@@ -1,0 +1,13 @@
+[package]
+name = "clickr-core"
+description = "Shared protocol and networking for the clickr presentation remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+iroh.workspace = true
+iroh-tickets.workspace = true
+n0-error.workspace = true
+tokio.workspace = true
+tracing.workspace = true

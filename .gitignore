@@ -1,0 +1,8 @@
+/target
+ios/Clickr.xcodeproj
+ios/ClickrKit/ClickrFFI.xcframework
+ios/ClickrKit/Sources/ClickrKit/clickr_ffi.swift
+ios/build
+xcuserdata/
+.DS_Store
+ios/Clickr/Info.plist
