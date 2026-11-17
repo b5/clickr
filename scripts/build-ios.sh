@@ -34,7 +34,7 @@ done
 echo "==> generating Swift bindings"
 cargo build -p clickr-ffi --lib ${CARGO_FLAGS[@]+"${CARGO_FLAGS[@]}"}
 rm -rf "$BUILD/bindings" "$HEADERS"
-mkdir -p "$BUILD/bindings" "$HEADERS"
+mkdir -p "$BUILD/bindings" "$HEADERS" "$KIT/Sources/ClickrKit"
 cargo run -q -p uniffi-bindgen -- generate \
   --library "target/$PROFILE/libclickr_ffi.dylib" \
   --language swift \
