@@ -14,3 +14,5 @@ name = "clickr_ffi"
 [dependencies]
 clickr-core.workspace = true
 uniffi = { version = "0.32", features = ["tokio"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }

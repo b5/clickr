@@ -5,7 +5,8 @@
 
 use std::{fmt, sync::Arc};
 
-use clickr_core::{Command, Remote};
+use clickr_core::{Command, Remote, SecretKey};
+use tracing_subscriber::filter::LevelFilter;
 
 uniffi::setup_scaffolding!();
 
@@ -15,6 +16,8 @@ uniffi::setup_scaffolding!();
 pub enum ClickrError {
     /// The pairing ticket could not be parsed.
     InvalidTicket(String),
+    /// The secret key is not 32 bytes long.
+    InvalidSecretKey(String),
     /// The receiver could not be reached or dropped the connection.
     Connection(String),
 }
@@ -23,6 +26,7 @@ impl fmt::Display for ClickrError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClickrError::InvalidTicket(msg) => write!(f, "invalid ticket: {msg}"),
+            ClickrError::InvalidSecretKey(msg) => write!(f, "invalid secret key: {msg}"),
             ClickrError::Connection(msg) => write!(f, "{msg}"),
         }
     }
@@ -32,6 +36,49 @@ impl std::error::Error for ClickrError {}
 
 fn conn_err(err: impl fmt::Display) -> ClickrError {
     ClickrError::Connection(format!("{err:#}"))
+}
+
+/// The most verbose level of log output to emit.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl From<LogLevel> for LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Error => LevelFilter::ERROR,
+            LogLevel::Warn => LevelFilter::WARN,
+            LogLevel::Info => LevelFilter::INFO,
+            LogLevel::Debug => LevelFilter::DEBUG,
+            LogLevel::Trace => LevelFilter::TRACE,
+        }
+    }
+}
+
+/// Sends Rust log output at `level` and above to stderr, which Xcode shows in its console.
+///
+/// Only the first call takes effect; later calls are ignored.
+#[uniffi::export]
+pub fn init_logging(level: LogLevel) {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(LevelFilter::from(level))
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .try_init();
+}
+
+/// Generates a new 32-byte secret key identifying this phone to receivers.
+///
+/// Store it and pass it to every [`ClickrRemote::connect`] call, so receivers that trusted
+/// this phone once keep trusting it.
+#[uniffi::export]
+pub fn generate_secret_key() -> Vec<u8> {
+    SecretKey::generate().to_bytes().to_vec()
 }
 
 /// Returns true if `ticket` parses as a pairing ticket.
@@ -48,12 +95,18 @@ pub struct ClickrRemote {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl ClickrRemote {
-    /// Connects to the receiver named by a pairing ticket.
+    /// Connects to the receiver named by a pairing ticket, identifying as `secret_key`
+    /// (see [`generate_secret_key`]).
     #[uniffi::constructor]
-    pub async fn connect(ticket: String) -> Result<Arc<Self>, ClickrError> {
+    pub async fn connect(ticket: String, secret_key: Vec<u8>) -> Result<Arc<Self>, ClickrError> {
         let ticket = clickr_core::parse_ticket(&ticket)
             .map_err(|err| ClickrError::InvalidTicket(format!("{err:#}")))?;
-        let inner = Remote::connect(ticket).await.map_err(conn_err)?;
+        let bytes: [u8; 32] = secret_key.as_slice().try_into().map_err(|_| {
+            ClickrError::InvalidSecretKey(format!("expected 32 bytes, got {}", secret_key.len()))
+        })?;
+        let inner = Remote::connect(ticket, SecretKey::from_bytes(&bytes))
+            .await
+            .map_err(conn_err)?;
         Ok(Arc::new(Self { inner }))
     }
 

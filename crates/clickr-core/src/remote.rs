@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId,
+    Endpoint, EndpointAddr, EndpointId, SecretKey,
     endpoint::{Connection, RecvStream, SendStream, presets},
 };
 use iroh_tickets::endpoint::EndpointTicket;
@@ -37,13 +37,20 @@ struct Session {
 }
 
 impl Remote {
-    /// Binds a fresh endpoint and connects to the receiver named by `ticket`.
+    /// Binds an endpoint with the given identity and connects to the receiver named by
+    /// `ticket`.
+    ///
+    /// Reuse the same `secret_key` across connections: receivers trust remotes by
+    /// endpoint id, so a fresh key looks like a new, untrusted phone.
     ///
     /// # Errors
     ///
     /// Returns an error if the endpoint cannot bind or the receiver is unreachable.
-    pub async fn connect(ticket: EndpointTicket) -> Result<Self> {
-        let endpoint = Endpoint::bind(presets::N0).await?;
+    pub async fn connect(ticket: EndpointTicket, secret_key: SecretKey) -> Result<Self> {
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret_key)
+            .bind()
+            .await?;
         Self::with_endpoint(endpoint, ticket).await
     }
 

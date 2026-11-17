@@ -132,7 +132,7 @@ mod tests {
         let receiver = Receiver::spawn(SecretKey::generate(), recorder.clone()).await?;
         receiver.endpoint().online().await;
         let ticket = parse_ticket(&receiver.ticket().to_string())?;
-        let remote = Remote::connect(ticket).await?;
+        let remote = Remote::connect(ticket, SecretKey::generate()).await?;
         remote.send(Command::Next).await?;
         assert_eq!(*recorder.seen.lock().unwrap(), vec![Command::Next]);
         remote.close().await;

@@ -500,6 +500,8 @@ name = "clickr-ffi"
 version = "0.1.0"
 dependencies = [
  "clickr-core",
+ "tracing",
+ "tracing-subscriber",
  "uniffi",
 ]
 

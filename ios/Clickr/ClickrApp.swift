@@ -1,10 +1,17 @@
+import ClickrKit
 import SwiftUI
 import UIKit
 
 @main
 struct ClickrApp: App {
-    @StateObject private var model = RemoteModel()
+    @StateObject private var model: RemoteModel
     @Environment(\.scenePhase) private var scenePhase
+
+    init() {
+        // Set up logging before the model starts connecting.
+        initLogging(level: .warn)
+        _model = StateObject(wrappedValue: RemoteModel())
+    }
 
     var body: some Scene {
         WindowGroup {

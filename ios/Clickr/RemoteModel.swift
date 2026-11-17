@@ -19,6 +19,8 @@ final class RemoteModel: ObservableObject {
     private static let ticketKey = "pairingTicket"
 
     private var remote: ClickrRemote?
+    /// This install's identity; the same key is used for every connection.
+    private let secretKey = DeviceKey.load()
     /// The tail of the queue of in-flight operations; chaining keeps presses in order.
     private var tail: Task<Void, Never>?
     private let impact = UIImpactFeedbackGenerator(style: .medium)
@@ -51,10 +53,17 @@ final class RemoteModel: ObservableObject {
         status = .idle
     }
 
+    /// Connects to the paired computer, closing any existing connection first.
     func connect() {
         guard let ticket else { return }
         enqueue { [weak self] in
             guard let self else { return }
+            // Close inside the queue so overlapping reconnects can't leave a connection
+            // open, and wait for it so two endpoints with the same key never overlap.
+            if let old = self.remote {
+                self.remote = nil
+                await old.close()
+            }
             await self.establish(ticket: ticket)
         }
     }
@@ -111,7 +120,7 @@ final class RemoteModel: ObservableObject {
     private func establish(ticket: String) async {
         status = .connecting
         do {
-            let remote = try await ClickrRemote.connect(ticket: ticket)
+            let remote = try await ClickrRemote.connect(ticket: ticket, secretKey: secretKey)
             self.remote = remote
             status = .connected(receiver: remote.receiverName())
         } catch {
@@ -136,7 +145,9 @@ final class RemoteModel: ObservableObject {
 
     private static func describe(_ error: Error) -> String {
         switch error {
-        case let ClickrError.InvalidTicket(message), let ClickrError.Connection(message):
+        case let ClickrError.InvalidTicket(message),
+             let ClickrError.InvalidSecretKey(message),
+             let ClickrError.Connection(message):
             return message
         default:
             return error.localizedDescription
