@@ -324,9 +324,7 @@ fn PairingCode(host: HostHandle) -> Element {
             }
         }
     } else {
-        rsx! {
-            p { class: "muted", "The code is hidden so it doesn't end up on a shared screen." }
-        }
+        rsx! {}
     };
 
     rsx! {
