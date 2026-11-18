@@ -4,7 +4,11 @@
 //! presented), asks before letting a new remote in, and lists known and revoked remotes
 //! with the network path each connected remote uses.
 
-use std::{collections::BTreeSet, rc::Rc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+    time::Duration,
+};
 
 use clickr_core::{Command, EndpointId};
 use clickr_host::{Approver, Event, Host, HostState, KnownDevice, Revocation, ago, config_dir};
@@ -67,13 +71,13 @@ struct Live {
     state: Signal<HostState>,
     connected: Signal<BTreeSet<EndpointId>>,
     requests: Signal<Vec<Request>>,
-    last_press: Signal<Option<Press>>,
+    /// Each known remote's most recent press, shown in its row.
+    presses: Signal<BTreeMap<EndpointId, Press>>,
 }
 
-/// The most recent button press.
+/// A remote's most recent button press.
 #[derive(Clone, Copy, PartialEq)]
 struct Press {
-    id: EndpointId,
     command: Command,
     /// Counts presses. Its parity picks one of two identical highlight animations, so
     /// even two presses of the same button restart it: changing an element's
@@ -87,7 +91,7 @@ async fn run_host(live: Live) -> Result<Rc<Host>, String> {
         mut state,
         mut connected,
         mut requests,
-        mut last_press,
+        mut presses,
     } = live;
     let (tx, mut rx) = mpsc::channel(PENDING_REQUESTS);
     let dir = config_dir().map_err(|err| format!("{err:#}"))?;
@@ -108,15 +112,24 @@ async fn run_host(live: Live) -> Result<Rc<Host>, String> {
     spawn(async move {
         loop {
             match events.recv().await {
-                Ok(Event::StateChanged) => state.set(watched.snapshot()),
+                Ok(Event::StateChanged) => {
+                    let snapshot = watched.snapshot();
+                    // A revoked or forgotten remote's last press must not come back if
+                    // it reconnects later.
+                    presses
+                        .write()
+                        .retain(|id, _| snapshot.known.contains_key(id));
+                    state.set(snapshot);
+                }
                 Ok(Event::Connected { .. } | Event::Disconnected { .. }) => {
                     connected.set(watched.connected());
                 }
                 // The "More" section polls paths along with latency.
                 Ok(Event::PathsChanged { .. }) => {}
                 Ok(Event::Pressed { id, command }) => {
-                    let seq = last_press.peek().map_or(0, |press| press.seq + 1);
-                    last_press.set(Some(Press { id, command, seq }));
+                    let mut presses = presses.write();
+                    let seq = presses.get(&id).map_or(0, |press| press.seq + 1);
+                    presses.insert(id, Press { command, seq });
                 }
                 Err(RecvError::Lagged(_)) => {
                     state.set(watched.snapshot());
@@ -135,7 +148,7 @@ fn App() -> Element {
         state: use_signal(HostState::default),
         connected: use_signal(BTreeSet::new),
         requests: use_signal(Vec::new),
-        last_press: use_signal(|| None),
+        presses: use_signal(BTreeMap::new),
     };
     let mut host = use_resource(move || run_host(live));
 
@@ -172,17 +185,7 @@ impl PartialEq for HostHandle {
 fn Main(host: HostHandle, live: Live) -> Element {
     let snapshot = live.state.read().clone();
     let online = live.connected.read().clone();
-    let press = (live.last_press)().map(|press| {
-        let name = snapshot
-            .known
-            .get(&press.id)
-            .map_or_else(|| press.id.fmt_short().to_string(), |d| d.nickname.clone());
-        let label = match press.command {
-            Command::Next => "Next",
-            Command::Previous => "Back",
-        };
-        (name, label, press.seq)
-    });
+    let presses = live.presses.read().clone();
 
     rsx! {
         Nickname { host: host.clone(), nickname: snapshot.nickname.clone() }
@@ -199,15 +202,7 @@ fn Main(host: HostHandle, live: Live) -> Element {
                     id,
                     device,
                     online: online.contains(&id),
-                }
-            }
-            if let Some(press) = press {
-                div { class: "last-press",
-                    span { class: "muted small", "Last press from {press.0}" }
-                    span {
-                        class: if press.2 % 2 == 0 { "press-word even" } else { "press-word odd" },
-                        "{press.1}"
-                    }
+                    press: presses.get(&id).copied(),
                 }
             }
         }
@@ -352,7 +347,13 @@ fn PairingCode(host: HostHandle) -> Element {
 }
 
 #[component]
-fn DeviceRow(host: HostHandle, id: EndpointId, device: KnownDevice, online: bool) -> Element {
+fn DeviceRow(
+    host: HostHandle,
+    id: EndpointId,
+    device: KnownDevice,
+    online: bool,
+    press: Option<Press>,
+) -> Element {
     let mut confirming = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
     let mut expanded = use_signal(|| false);
@@ -370,6 +371,15 @@ fn DeviceRow(host: HostHandle, id: EndpointId, device: KnownDevice, online: bool
                 div { class: "muted small", span { class: "mono", "{id.fmt_short()}" } " - {status}" }
                 if let Some(err) = error() {
                     div { class: "error-text small", "{err}" }
+                }
+            }
+            if let Some(press) = press {
+                span {
+                    class: if press.seq % 2 == 0 { "press-word even" } else { "press-word odd" },
+                    match press.command {
+                        Command::Next => "Next",
+                        Command::Previous => "Back",
+                    }
                 }
             }
             if confirming() {
