@@ -1,0 +1,139 @@
+:root {
+  --bg: #f4f4f6;
+  --card: #ffffff;
+  --text: #1c1c1e;
+  --muted: #6e6e73;
+  --border: #e3e3e8;
+  --accent: #0a84ff;
+  --danger: #d70015;
+  --online: #30d158;
+  color-scheme: light dark;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1c1e;
+    --card: #2c2c2e;
+    --text: #f2f2f7;
+    --muted: #98989f;
+    --border: #3a3a3c;
+    --accent: #0a84ff;
+    --danger: #ff453a;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+main { padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+
+h1 { font-size: 22px; margin: 0; }
+h2 { font-size: 15px; margin: 0; }
+p { margin: 6px 0 0; }
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.title, .row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.center { text-align: center; }
+.mono { font-family: ui-monospace, Menlo, monospace; }
+.error-text { color: var(--danger); }
+.error pre { white-space: pre-wrap; font-size: 12px; }
+
+button {
+  font: inherit;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 12px;
+  background: var(--accent);
+  color: white;
+  cursor: pointer;
+  white-space: nowrap;
+}
+button.secondary { background: var(--border); color: var(--text); }
+button.danger { background: var(--danger); }
+
+.nickname-input {
+  flex: 1;
+  font: inherit;
+  font-size: 18px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--text);
+}
+
+.qr { align-self: center; background: white; padding: 8px; border-radius: 8px; }
+.qr svg { display: block; width: 240px; height: 240px; }
+
+.ticket {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+  background: var(--bg);
+  padding: 8px;
+  border-radius: 8px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.device {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+.device-text { flex: 1; min-width: 0; }
+.device-text div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.online { background: var(--online); }
+.dot.revoked { background: var(--danger); }
+
+.last-press { font-size: 12px; }
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+.dialog {
+  background: var(--card);
+  border-radius: 14px;
+  padding: 18px;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+}
+.actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 8px; }
