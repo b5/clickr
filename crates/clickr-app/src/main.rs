@@ -67,7 +67,18 @@ struct Live {
     state: Signal<HostState>,
     connected: Signal<BTreeSet<EndpointId>>,
     requests: Signal<Vec<Request>>,
-    last_press: Signal<Option<(EndpointId, Command)>>,
+    last_press: Signal<Option<Press>>,
+}
+
+/// The most recent button press.
+#[derive(Clone, Copy, PartialEq)]
+struct Press {
+    id: EndpointId,
+    command: Command,
+    /// Counts presses. Its parity picks one of two identical highlight animations, so
+    /// even two presses of the same button restart it: changing an element's
+    /// animation name always replays the animation.
+    seq: u64,
 }
 
 /// Starts the host and keeps the signals in sync with it until the window closes.
@@ -103,7 +114,10 @@ async fn run_host(live: Live) -> Result<Rc<Host>, String> {
                 }
                 // The "More" section polls paths along with latency.
                 Ok(Event::PathsChanged { .. }) => {}
-                Ok(Event::Pressed { id, command }) => last_press.set(Some((id, command))),
+                Ok(Event::Pressed { id, command }) => {
+                    let seq = last_press.peek().map_or(0, |press| press.seq + 1);
+                    last_press.set(Some(Press { id, command, seq }));
+                }
                 Err(RecvError::Lagged(_)) => {
                     state.set(watched.snapshot());
                     connected.set(watched.connected());
@@ -158,16 +172,16 @@ impl PartialEq for HostHandle {
 fn Main(host: HostHandle, live: Live) -> Element {
     let snapshot = live.state.read().clone();
     let online = live.connected.read().clone();
-    let press = (live.last_press)().map(|(id, command)| {
+    let press = (live.last_press)().map(|press| {
         let name = snapshot
             .known
-            .get(&id)
-            .map_or_else(|| id.fmt_short().to_string(), |d| d.nickname.clone());
-        let label = match command {
+            .get(&press.id)
+            .map_or_else(|| press.id.fmt_short().to_string(), |d| d.nickname.clone());
+        let label = match press.command {
             Command::Next => "Next",
             Command::Previous => "Back",
         };
-        format!("{name}: {label}")
+        (name, label, press.seq)
     });
 
     rsx! {
@@ -188,7 +202,13 @@ fn Main(host: HostHandle, live: Live) -> Element {
                 }
             }
             if let Some(press) = press {
-                p { class: "muted last-press", "Last press: {press}" }
+                div { class: "last-press",
+                    span { class: "muted small", "Last press from {press.0}" }
+                    span {
+                        class: if press.2 % 2 == 0 { "press-word even" } else { "press-word odd" },
+                        "{press.1}"
+                    }
+                }
             }
         }
         if !snapshot.revoked.is_empty() {
