@@ -5,7 +5,7 @@
 
 use std::{fmt, sync::Arc};
 
-use clickr_core::{AccessError, Command, Endpoint, EndpointId, Remote, SecretKey};
+use clickr_core::{AccessError, Bluetooth, Command, Endpoint, EndpointId, Remote, SecretKey};
 use n0_error::AnyError;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -127,14 +127,20 @@ pub struct ClickrPaths {
     pub standby: Vec<String>,
     /// Both of the above in one line, like "via IPv4 (also Bluetooth)".
     pub summary: String,
+    /// The round-trip time of the selected path in milliseconds, as estimated by QUIC.
+    pub rtt_ms: Option<u32>,
 }
 
-impl From<clickr_core::Paths> for ClickrPaths {
-    fn from(paths: clickr_core::Paths) -> Self {
+impl From<clickr_core::Link> for ClickrPaths {
+    fn from(link: clickr_core::Link) -> Self {
+        let paths = link.paths;
         Self {
             selected: paths.selected.map(|t| t.to_string()),
             standby: paths.standby().map(|t| t.to_string()).collect(),
             summary: paths.to_string(),
+            rtt_ms: link
+                .rtt
+                .map(|rtt| u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX)),
         }
     }
 }
@@ -147,6 +153,7 @@ impl From<clickr_core::Paths> for ClickrPaths {
 #[derive(Debug, uniffi::Object)]
 pub struct ClickrNode {
     endpoint: Endpoint,
+    bluetooth: Bluetooth,
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -157,10 +164,22 @@ impl ClickrNode {
         let bytes: [u8; 32] = secret_key.as_slice().try_into().map_err(|_| {
             ClickrError::InvalidSecretKey(format!("expected 32 bytes, got {}", secret_key.len()))
         })?;
-        let endpoint = clickr_core::bind_endpoint(SecretKey::from_bytes(&bytes))
+        let (endpoint, bluetooth) = clickr_core::bind_endpoint(SecretKey::from_bytes(&bytes))
             .await
             .map_err(conn_err)?;
-        Ok(Arc::new(Self { endpoint }))
+        Ok(Arc::new(Self {
+            endpoint,
+            bluetooth,
+        }))
+    }
+
+    /// Describes what this phone's Bluetooth transport knows about the computer with
+    /// endpoint id `peer_id`, like "on, other device seen, link connected over L2CAP".
+    pub fn bluetooth_status(&self, peer_id: String) -> String {
+        match peer_id.parse::<EndpointId>() {
+            Ok(peer) => self.bluetooth.status(peer).to_string(),
+            Err(err) => format!("invalid endpoint id: {err}"),
+        }
     }
 
     /// Connects to the receiver named by a pairing ticket, introducing this phone as
@@ -211,11 +230,12 @@ impl ClickrRemote {
         self.inner.receiver_id().fmt_short().to_string()
     }
 
-    /// Returns the current connection's network paths, or `None` when not connected.
+    /// Returns the current connection's network paths and latency, or `None` when not
+    /// connected.
     ///
     /// Reads local state only, so it is cheap to poll.
     pub fn paths(&self) -> Option<ClickrPaths> {
-        self.inner.paths().map(ClickrPaths::from)
+        self.inner.link().map(ClickrPaths::from)
     }
 
     /// Returns the nickname the receiver reported.

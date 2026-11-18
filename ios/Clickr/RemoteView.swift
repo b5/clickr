@@ -4,6 +4,7 @@ import SwiftUI
 struct RemoteView: View {
     @EnvironmentObject private var model: RemoteModel
     @State private var confirmUnpair = false
+    @State private var showDetails = false
 
     var body: some View {
         VStack(spacing: 16) {
@@ -19,6 +20,9 @@ struct RemoteView: View {
             .layoutPriority(1)
         }
         .padding()
+        .sheet(isPresented: $showDetails) {
+            ConnectionDetailsView()
+        }
         .confirmationDialog("Forget this computer?", isPresented: $confirmUnpair) {
             Button("Forget", role: .destructive) {
                 if let id = model.selectedID { model.forget(id: id) }
@@ -55,6 +59,7 @@ struct RemoteView: View {
                     .buttonStyle(.bordered)
             }
             Menu {
+                Button("Connection details") { showDetails = true }
                 Button("Reconnect") { model.connect() }
                 Button("Forget computer", role: .destructive) { confirmUnpair = true }
             } label: {

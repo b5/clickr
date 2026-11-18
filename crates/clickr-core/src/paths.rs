@@ -1,6 +1,6 @@
 //! Which network paths a connection uses, for display.
 
-use std::{collections::BTreeSet, fmt};
+use std::{collections::BTreeSet, fmt, time::Duration};
 
 use iroh::{TransportAddr, endpoint::Connection};
 
@@ -75,6 +75,30 @@ impl Paths {
             .iter()
             .copied()
             .filter(|transport| Some(*transport) != self.selected)
+    }
+}
+
+/// A connection's paths and the round-trip time of the one in use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    /// The open and selected paths.
+    pub paths: Paths,
+    /// The round-trip time of the selected path, as estimated by QUIC.
+    pub rtt: Option<Duration>,
+}
+
+impl Link {
+    /// Reads the current paths and latency of `connection`.
+    pub fn of(connection: &Connection) -> Self {
+        let rtt = connection
+            .paths()
+            .iter()
+            .find(|path| path.is_selected())
+            .map(|path| path.rtt());
+        Self {
+            paths: Paths::of(connection),
+            rtt,
+        }
     }
 }
 

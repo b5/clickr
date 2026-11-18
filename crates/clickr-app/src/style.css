@@ -111,16 +111,29 @@ button.danger { background: var(--danger); }
 .device-text { flex: 1; min-width: 0; }
 .device-text div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.device-name { display: flex; align-items: center; gap: 6px; }
-.badge {
-  font-size: 11px;
-  padding: 1px 6px;
-  border-radius: 6px;
-  background: var(--bg);
-  border: 1px solid var(--border);
+button.disclosure {
+  align-self: flex-start;
+  background: none;
   color: var(--muted);
-  flex: none;
+  padding: 0 0 4px 20px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
+.triangle { display: inline-block; transition: transform 0.15s; }
+.triangle.open { transform: rotate(90deg); }
+
+.details {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 12px;
+  margin: 0 0 8px 20px;
+  font-size: 12px;
+}
+.details dt { color: var(--muted); }
+.details dd { margin: 0; word-break: break-all; }
+.selectable { -webkit-user-select: text; user-select: text; }
 
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
 .dot.online { background: var(--online); }

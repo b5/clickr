@@ -24,6 +24,8 @@ final class RemoteModel: ObservableObject {
     @Published private(set) var lastRoundTripMs: UInt32?
     /// The current connection's network paths, refreshed every couple of seconds.
     @Published private(set) var paths: ClickrPaths?
+    /// What this phone's Bluetooth transport knows about the selected computer.
+    @Published private(set) var bluetoothStatus: String?
     @Published private(set) var nickname: String
 
     var selected: KnownHost? { selectedID.flatMap { store.host(id: $0) } }
@@ -67,6 +69,8 @@ final class RemoteModel: ObservableObject {
     private func refreshPaths() {
         let current = remote?.paths()
         if current != paths { paths = current }
+        let bluetooth = selectedID.flatMap { id in node?.bluetoothStatus(peerId: id) }
+        if bluetooth != bluetoothStatus { bluetoothStatus = bluetooth }
     }
 
     // MARK: Known computers

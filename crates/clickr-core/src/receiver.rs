@@ -19,7 +19,7 @@ use n0_future::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::{
-    ACK_OK, ACK_UNKNOWN, ALPN, Command, Paths, bind_endpoint,
+    ACK_OK, ACK_UNKNOWN, ALPN, Bluetooth, BluetoothStatus, Command, Link, Paths, bind_endpoint,
     capability::{issue_connect, verify_connect},
     wire::{Hello, Welcome, read_message, write_message},
 };
@@ -74,6 +74,7 @@ type Live = Arc<Mutex<HashMap<EndpointId, Vec<Connection>>>>;
 pub struct Receiver {
     router: Router,
     live: Live,
+    bluetooth: Bluetooth,
 }
 
 impl Receiver {
@@ -83,8 +84,8 @@ impl Receiver {
     /// lookup, so a ticket stays usable across network changes as long as the secret key
     /// stays the same, and accepts remotes over Bluetooth when available.
     pub async fn spawn(secret_key: SecretKey, handler: impl ReceiverHandler) -> Result<Self> {
-        let endpoint = bind_endpoint(secret_key).await?;
-        Ok(Self::with_endpoint(endpoint, handler))
+        let (endpoint, bluetooth) = bind_endpoint(secret_key).await?;
+        Ok(Self::with_endpoint(endpoint, bluetooth, handler))
     }
 
     /// Binds a loopback-only endpoint without relays or address lookup, for tests.
@@ -98,10 +99,15 @@ impl Receiver {
             .bind_addr("127.0.0.1:0")?
             .bind()
             .await?;
-        Ok(Self::with_endpoint(endpoint, handler))
+        let bluetooth = Bluetooth::unavailable("not used in tests");
+        Ok(Self::with_endpoint(endpoint, bluetooth, handler))
     }
 
-    fn with_endpoint(endpoint: Endpoint, handler: impl ReceiverHandler) -> Self {
+    fn with_endpoint(
+        endpoint: Endpoint,
+        bluetooth: Bluetooth,
+        handler: impl ReceiverHandler,
+    ) -> Self {
         let live = Live::default();
         let handler = Handler {
             handler: Arc::new(handler),
@@ -109,7 +115,11 @@ impl Receiver {
             live: live.clone(),
         };
         let router = Router::builder(endpoint).accept(ALPN, handler).spawn();
-        Self { router, live }
+        Self {
+            router,
+            live,
+            bluetooth,
+        }
     }
 
     /// Returns the underlying endpoint.
@@ -129,6 +139,18 @@ impl Receiver {
             .into_iter()
             .filter(|addr| !matches!(addr, TransportAddr::Custom(_)));
         EndpointTicket::new(EndpointAddr::from_parts(addr.id, addrs))
+    }
+
+    /// Returns the paths and latency of `remote`'s newest connection, or `None` if it is
+    /// not connected.
+    pub fn link(&self, remote: EndpointId) -> Option<Link> {
+        let live = self.live.lock().expect("poisoned");
+        live.get(&remote)?.last().map(Link::of)
+    }
+
+    /// Reports what the Bluetooth transport knows about `remote`.
+    pub fn bluetooth(&self, remote: EndpointId) -> BluetoothStatus {
+        self.bluetooth.status(remote)
     }
 
     /// Closes every connection from `remote`.

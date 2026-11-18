@@ -14,7 +14,9 @@ use std::{
     time::Duration,
 };
 
-use clickr_core::{Command, EndpointId, EndpointTicket, Paths, Receiver, ReceiverHandler};
+use clickr_core::{
+    BluetoothStatus, Command, EndpointId, EndpointTicket, Link, Paths, Receiver, ReceiverHandler,
+};
 use n0_error::Result;
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -153,6 +155,18 @@ impl Host {
     /// Returns the latest network paths of each connected remote.
     pub fn paths(&self) -> BTreeMap<EndpointId, Paths> {
         self.shared.paths.lock().expect("poisoned").clone()
+    }
+
+    /// Returns the paths and latency of `id`'s connection, or `None` if not connected.
+    ///
+    /// Latency changes all the time without an [`Event`], so poll this while showing it.
+    pub fn link(&self, id: EndpointId) -> Option<Link> {
+        self.receiver.link(id)
+    }
+
+    /// Reports what the Bluetooth transport knows about `id`.
+    pub fn bluetooth(&self, id: EndpointId) -> BluetoothStatus {
+        self.receiver.bluetooth(id)
     }
 
     /// Returns a stream of [`Event`]s from now on.

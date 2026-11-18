@@ -4,12 +4,9 @@
 //! presented), asks before letting a new remote in, and lists known and revoked remotes
 //! with the network path each connected remote uses.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    rc::Rc,
-};
+use std::{collections::BTreeSet, rc::Rc, time::Duration};
 
-use clickr_core::{Command, EndpointId, Paths};
+use clickr_core::{Command, EndpointId};
 use clickr_host::{Approver, Event, Host, HostState, KnownDevice, Revocation, ago, config_dir};
 use dioxus::{
     desktop::{Config, LogicalSize, WindowBuilder},
@@ -20,6 +17,8 @@ use tokio::sync::{broadcast::error::RecvError, mpsc, oneshot};
 
 /// How many approval requests may wait for the user at once.
 const PENDING_REQUESTS: usize = 8;
+/// How often an open "More" section refreshes; latency changes without events.
+const DETAILS_REFRESH: Duration = Duration::from_secs(1);
 
 const STYLE: &str = include_str!("style.css");
 
@@ -67,7 +66,6 @@ impl Approver for WindowApprover {
 struct Live {
     state: Signal<HostState>,
     connected: Signal<BTreeSet<EndpointId>>,
-    paths: Signal<BTreeMap<EndpointId, Paths>>,
     requests: Signal<Vec<Request>>,
     last_press: Signal<Option<(EndpointId, Command)>>,
 }
@@ -77,7 +75,6 @@ async fn run_host(live: Live) -> Result<Rc<Host>, String> {
     let Live {
         mut state,
         mut connected,
-        mut paths,
         mut requests,
         mut last_press,
     } = live;
@@ -103,16 +100,13 @@ async fn run_host(live: Live) -> Result<Rc<Host>, String> {
                 Ok(Event::StateChanged) => state.set(watched.snapshot()),
                 Ok(Event::Connected { .. } | Event::Disconnected { .. }) => {
                     connected.set(watched.connected());
-                    paths.set(watched.paths());
                 }
-                Ok(Event::PathsChanged { id, paths: changed }) => {
-                    paths.write().insert(id, changed);
-                }
+                // The "More" section polls paths along with latency.
+                Ok(Event::PathsChanged { .. }) => {}
                 Ok(Event::Pressed { id, command }) => last_press.set(Some((id, command))),
                 Err(RecvError::Lagged(_)) => {
                     state.set(watched.snapshot());
                     connected.set(watched.connected());
-                    paths.set(watched.paths());
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -126,7 +120,6 @@ fn App() -> Element {
     let live = Live {
         state: use_signal(HostState::default),
         connected: use_signal(BTreeSet::new),
-        paths: use_signal(BTreeMap::new),
         requests: use_signal(Vec::new),
         last_press: use_signal(|| None),
     };
@@ -165,7 +158,6 @@ impl PartialEq for HostHandle {
 fn Main(host: HostHandle, live: Live) -> Element {
     let snapshot = live.state.read().clone();
     let online = live.connected.read().clone();
-    let paths = live.paths.read().clone();
     let press = (live.last_press)().map(|(id, command)| {
         let name = snapshot
             .known
@@ -193,7 +185,6 @@ fn Main(host: HostHandle, live: Live) -> Element {
                     id,
                     device,
                     online: online.contains(&id),
-                    paths: paths.get(&id).cloned(),
                 }
             }
             if let Some(press) = press {
@@ -341,36 +332,21 @@ fn PairingCode(host: HostHandle) -> Element {
 }
 
 #[component]
-fn DeviceRow(
-    host: HostHandle,
-    id: EndpointId,
-    device: KnownDevice,
-    online: bool,
-    paths: Option<Paths>,
-) -> Element {
+fn DeviceRow(host: HostHandle, id: EndpointId, device: KnownDevice, online: bool) -> Element {
     let mut confirming = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
-    let status = match (&paths, online) {
-        (Some(paths), true) => format!("Connected {paths}"),
-        (None, true) => "Connected".to_string(),
-        (_, false) => format!("Last seen {}", ago(device.last_seen)),
+    let mut expanded = use_signal(|| false);
+    let status = if online {
+        "Connected".to_string()
+    } else {
+        format!("Last seen {}", ago(device.last_seen))
     };
-    let badge = paths
-        .as_ref()
-        .filter(|_| online)
-        .and_then(|paths| paths.selected)
-        .map(|transport| transport.to_string());
 
     rsx! {
         div { class: "device",
             span { class: if online { "dot online" } else { "dot" } }
             div { class: "device-text",
-                div { class: "device-name",
-                    span { "{device.nickname}" }
-                    if let Some(badge) = badge {
-                        span { class: "badge", "{badge}" }
-                    }
-                }
+                div { "{device.nickname}" }
                 div { class: "muted small", span { class: "mono", "{id.fmt_short()}" } " - {status}" }
                 if let Some(err) = error() {
                     div { class: "error-text small", "{err}" }
@@ -380,10 +356,13 @@ fn DeviceRow(
                 button { class: "secondary", onclick: move |_| confirming.set(false), "Cancel" }
                 button {
                     class: "danger",
-                    onclick: move |_| {
-                        confirming.set(false);
-                        if let Err(err) = host.0.revoke(id) {
-                            error.set(Some(format!("{err:#}")));
+                    onclick: {
+                        let host = host.clone();
+                        move |_| {
+                            confirming.set(false);
+                            if let Err(err) = host.0.revoke(id) {
+                                error.set(Some(format!("{err:#}")));
+                            }
                         }
                     },
                     "Revoke"
@@ -391,6 +370,69 @@ fn DeviceRow(
             } else {
                 button { class: "secondary", onclick: move |_| confirming.set(true), "Revoke..." }
             }
+        }
+        button {
+            class: "disclosure",
+            onclick: move |_| expanded.toggle(),
+            span { class: if expanded() { "triangle open" } else { "triangle" }, "\u{25B8}" }
+            "More"
+        }
+        if expanded() {
+            DeviceDetails { host, id }
+        }
+    }
+}
+
+/// The endpoint id, connection type, latency, and Bluetooth state of one remote,
+/// refreshed every second while shown.
+#[component]
+fn DeviceDetails(host: HostHandle, id: EndpointId) -> Element {
+    let mut link = use_signal(|| host.0.link(id));
+    let mut bluetooth = use_signal(|| host.0.bluetooth(id));
+    use_future({
+        let host = host.clone();
+        move || {
+            let host = host.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(DETAILS_REFRESH).await;
+                    link.set(host.0.link(id));
+                    bluetooth.set(host.0.bluetooth(id));
+                }
+            }
+        }
+    });
+
+    let (connection, latency) = match link() {
+        Some(link) => {
+            let selected = link
+                .paths
+                .selected
+                .map_or_else(|| "no path selected".to_string(), |t| t.to_string());
+            let standby: Vec<String> = link.paths.standby().map(|t| t.to_string()).collect();
+            let connection = if standby.is_empty() {
+                selected
+            } else {
+                format!("{selected} (also {})", standby.join(", "))
+            };
+            let latency = link
+                .rtt
+                .map_or_else(|| "-".to_string(), |rtt| format!("{} ms", rtt.as_millis()));
+            (connection, latency)
+        }
+        None => ("not connected".to_string(), "-".to_string()),
+    };
+
+    rsx! {
+        dl { class: "details",
+            dt { "Endpoint ID" }
+            dd { class: "mono selectable", "{id}" }
+            dt { "Connection" }
+            dd { "{connection}" }
+            dt { "Latency" }
+            dd { "{latency}" }
+            dt { "Bluetooth" }
+            dd { "{bluetooth}" }
         }
     }
 }

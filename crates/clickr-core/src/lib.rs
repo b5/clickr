@@ -39,8 +39,8 @@ mod wire;
 
 pub use self::{
     capability::Cap,
-    endpoint::bind_endpoint,
-    paths::{Paths, Transport},
+    endpoint::{Adapter, Bluetooth, BluetoothLink, BluetoothStatus, bind_endpoint},
+    paths::{Link, Paths, Transport},
     receiver::{Receiver, ReceiverHandler},
     remote::{AccessError, Remote},
 };
@@ -394,7 +394,7 @@ mod tests {
         remote.send(Command::Next).await?;
 
         assert_eq!(
-            remote.paths().and_then(|p| p.selected),
+            remote.link().and_then(|link| link.paths.selected),
             Some(Transport::Ipv4)
         );
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -412,8 +412,12 @@ mod tests {
         .await
         .std_context("receiver did not report the path")?;
 
+        let link = receiver.link(endpoint.id()).std_context("no link")?;
+        assert_eq!(link.paths.selected, Some(Transport::Ipv4));
+        assert!(link.rtt.is_some());
+
         remote.close().await;
-        assert_eq!(remote.paths(), None);
+        assert_eq!(remote.link(), None);
         endpoint.close().await;
         receiver.shutdown().await;
         Ok(())
@@ -431,7 +435,7 @@ mod tests {
 
         *recorder.stall.lock().unwrap() = Some(Duration::from_secs(6));
         assert!(remote.send(Command::Next).await.is_err());
-        assert_eq!(remote.paths(), None);
+        assert_eq!(remote.link(), None);
 
         remote.send(Command::Previous).await?;
         assert_eq!(recorder.connections.load(Ordering::SeqCst), 2);
@@ -455,7 +459,7 @@ mod tests {
         let receiver = Receiver::spawn(SecretKey::generate(), recorder.clone()).await?;
         receiver.endpoint().online().await;
         let ticket = parse_ticket(&receiver.ticket().to_string())?;
-        let endpoint = bind_endpoint(SecretKey::generate()).await?;
+        let (endpoint, _bluetooth) = bind_endpoint(SecretKey::generate()).await?;
         let remote = Remote::connect(&endpoint, ticket, "Swift Otter".into(), None).await?;
         remote.send(Command::Next).await?;
         assert_eq!(*recorder.seen.lock().unwrap(), vec![Command::Next]);

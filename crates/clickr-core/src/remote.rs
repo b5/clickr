@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::{
-    ACK_OK, ALPN, Command, Paths,
+    ACK_OK, ALPN, Command, Link,
     wire::{Hello, Welcome, read_message, write_message},
 };
 
@@ -151,11 +151,12 @@ impl Remote {
             .clone()
     }
 
-    /// Returns the paths of the current connection, or `None` when not connected.
-    pub fn paths(&self) -> Option<Paths> {
+    /// Returns the paths and latency of the current connection, or `None` when not
+    /// connected.
+    pub fn link(&self) -> Option<Link> {
         let access = self.access.lock().expect("poisoned");
         let conn = access.conn.as_ref()?;
-        conn.close_reason().is_none().then(|| Paths::of(conn))
+        conn.close_reason().is_none().then(|| Link::of(conn))
     }
 
     /// Returns the token to present on future connections, if the receiver issued one.
