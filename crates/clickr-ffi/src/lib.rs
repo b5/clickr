@@ -5,7 +5,8 @@
 
 use std::{fmt, sync::Arc};
 
-use clickr_core::{Command, Endpoint, Remote, SecretKey};
+use clickr_core::{AccessError, Command, Endpoint, EndpointId, Remote, SecretKey};
+use n0_error::AnyError;
 use tracing_subscriber::filter::LevelFilter;
 
 uniffi::setup_scaffolding!();
@@ -18,6 +19,10 @@ pub enum ClickrError {
     InvalidTicket(String),
     /// The secret key is not 32 bytes long.
     InvalidSecretKey(String),
+    /// The user on the receiver declined this phone.
+    Denied(String),
+    /// The receiver revoked this phone's access.
+    Revoked(String),
     /// The receiver could not be reached or dropped the connection.
     Connection(String),
 }
@@ -27,15 +32,25 @@ impl fmt::Display for ClickrError {
         match self {
             ClickrError::InvalidTicket(msg) => write!(f, "invalid ticket: {msg}"),
             ClickrError::InvalidSecretKey(msg) => write!(f, "invalid secret key: {msg}"),
-            ClickrError::Connection(msg) => write!(f, "{msg}"),
+            ClickrError::Denied(msg) | ClickrError::Revoked(msg) | ClickrError::Connection(msg) => {
+                write!(f, "{msg}")
+            }
         }
     }
 }
 
 impl std::error::Error for ClickrError {}
 
-fn conn_err(err: impl fmt::Display) -> ClickrError {
-    ClickrError::Connection(format!("{err:#}"))
+fn conn_err(err: AnyError) -> ClickrError {
+    match err.downcast_ref::<AccessError>() {
+        Some(AccessError::Denied) => ClickrError::Denied(err.to_string()),
+        Some(AccessError::Revoked) => ClickrError::Revoked(err.to_string()),
+        None => ClickrError::Connection(format!("{err:#}")),
+    }
+}
+
+fn parse_ticket(ticket: &str) -> Result<clickr_core::EndpointTicket, ClickrError> {
+    clickr_core::parse_ticket(ticket).map_err(|err| ClickrError::InvalidTicket(format!("{err:#}")))
 }
 
 /// The most verbose level of log output to emit.
@@ -87,6 +102,21 @@ pub fn is_valid_ticket(ticket: String) -> bool {
     clickr_core::parse_ticket(&ticket).is_ok()
 }
 
+/// Returns the endpoint id of the receiver named by `ticket`, which identifies it across
+/// tickets with different addresses.
+#[uniffi::export]
+pub fn ticket_endpoint_id(ticket: String) -> Result<String, ClickrError> {
+    Ok(parse_ticket(&ticket)?.endpoint_addr().id.to_string())
+}
+
+/// Returns the short form of an endpoint id, for display, or `id` itself if it does not
+/// parse.
+#[uniffi::export]
+pub fn short_endpoint_id(id: String) -> String {
+    id.parse::<EndpointId>()
+        .map_or(id, |id| id.fmt_short().to_string())
+}
+
 /// The phone's iroh endpoint, reaching receivers over the internet and Bluetooth.
 ///
 /// Bind one node when the app starts and keep it for the life of the process: the
@@ -111,18 +141,27 @@ impl ClickrNode {
         Ok(Arc::new(Self { endpoint }))
     }
 
-    /// Connects to the receiver named by a pairing ticket.
-    pub async fn connect(&self, ticket: String) -> Result<Arc<ClickrRemote>, ClickrError> {
-        let ticket = clickr_core::parse_ticket(&ticket)
-            .map_err(|err| ClickrError::InvalidTicket(format!("{err:#}")))?;
-        let inner = Remote::connect(&self.endpoint, ticket)
+    /// Connects to the receiver named by a pairing ticket, introducing this phone as
+    /// `nickname`.
+    ///
+    /// Pass the token from [`ClickrRemote::token`] of an earlier connection, if any.
+    /// Without a valid token the receiver asks its user first, and this waits up to two
+    /// minutes for the answer.
+    pub async fn connect(
+        &self,
+        ticket: String,
+        nickname: String,
+        token: Option<Vec<u8>>,
+    ) -> Result<Arc<ClickrRemote>, ClickrError> {
+        let ticket = parse_ticket(&ticket)?;
+        let inner = Remote::connect(&self.endpoint, ticket, nickname, token)
             .await
             .map_err(conn_err)?;
         Ok(Arc::new(ClickrRemote { inner }))
     }
 }
 
-/// A connection from the phone to a `clickr accept` receiver.
+/// A connection from the phone to a receiver.
 #[derive(Debug, uniffi::Object)]
 pub struct ClickrRemote {
     inner: Remote,
@@ -146,8 +185,19 @@ impl ClickrRemote {
     }
 
     /// Returns a short form of the receiver's endpoint id, for display.
-    pub fn receiver_name(&self) -> String {
+    pub fn receiver_short_id(&self) -> String {
         self.inner.receiver_id().fmt_short().to_string()
+    }
+
+    /// Returns the nickname the receiver reported.
+    pub fn receiver_nickname(&self) -> String {
+        self.inner.receiver_nickname()
+    }
+
+    /// Returns the `CONNECT` token to store and pass to the next
+    /// [`ClickrNode::connect`], if the receiver issued one.
+    pub fn token(&self) -> Option<Vec<u8>> {
+        self.inner.token()
     }
 
     /// Closes the connection. The node's endpoint stays open for later connections.

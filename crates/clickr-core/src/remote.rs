@@ -1,20 +1,53 @@
 //! The sending side of the protocol, run on the phone.
 
-use std::time::{Duration, Instant};
+use std::{
+    fmt,
+    sync::Mutex as StdMutex,
+    time::{Duration, Instant},
+};
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
     endpoint::{Connection, RecvStream, SendStream},
 };
 use iroh_tickets::endpoint::EndpointTicket;
-use n0_error::{Result, StdResultExt, anyerr};
+use n0_error::{AnyError, Result, StdResultExt, anyerr};
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
-use crate::{ACK_OK, ALPN, Command};
+use crate::{
+    ACK_OK, ALPN, Command,
+    wire::{Hello, Welcome, read_message, write_message},
+};
 
 /// How long a single command may take, including a reconnect, before it fails.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long [`Remote::connect`] waits, which covers the user approving a new remote on the
+/// receiver.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The receiver turned the remote away.
+///
+/// Returned inside the [`AnyError`] of a failed [`Remote::connect`], [`Remote::send`] or
+/// [`Remote::ensure_connected`]; find it with [`AnyError::downcast_ref`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessError {
+    /// The user on the receiver declined this remote.
+    Denied,
+    /// The receiver revoked this remote's access.
+    Revoked,
+}
+
+impl fmt::Display for AccessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AccessError::Denied => f.write_str("access denied"),
+            AccessError::Revoked => f.write_str("access revoked"),
+        }
+    }
+}
+
+impl std::error::Error for AccessError {}
 
 /// A connection to a [`Receiver`] that sends slide commands.
 ///
@@ -30,7 +63,16 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct Remote {
     endpoint: Endpoint,
     addr: EndpointAddr,
+    nickname: String,
+    access: StdMutex<Access>,
     session: Mutex<Option<Session>>,
+}
+
+/// What the receiver told us in its last [`Welcome`].
+#[derive(Debug, Default)]
+struct Access {
+    token: Option<Vec<u8>>,
+    receiver_nickname: String,
 }
 
 #[derive(Debug)]
@@ -41,22 +83,43 @@ struct Session {
 }
 
 impl Remote {
-    /// Connects to the receiver named by `ticket` from `endpoint`.
+    /// Connects to the receiver named by `ticket` from `endpoint`, introducing this remote
+    /// as `nickname`.
     ///
-    /// Receivers trust remotes by endpoint id, so bind `endpoint` with the same secret key
-    /// every time; a fresh key looks like a new, untrusted phone.
+    /// Pass the `token` the receiver issued on an earlier connection, if any. Without a
+    /// valid token the receiver asks its user, and this waits up to two minutes for the
+    /// answer. Afterwards [`token`] holds the token to store for next time.
+    ///
+    /// Tokens are bound to the remote's endpoint id, so bind `endpoint` with the same
+    /// secret key every time.
     ///
     /// # Errors
     ///
-    /// Returns an error if the receiver is unreachable.
-    pub async fn connect(endpoint: &Endpoint, ticket: EndpointTicket) -> Result<Self> {
-        let addr: EndpointAddr = ticket.into();
-        let session = Session::open(endpoint, addr.clone()).await?;
-        Ok(Self {
+    /// Returns an error if the receiver is unreachable or turned this remote away (see
+    /// [`AccessError`]).
+    ///
+    /// [`token`]: Self::token
+    pub async fn connect(
+        endpoint: &Endpoint,
+        ticket: EndpointTicket,
+        nickname: String,
+        token: Option<Vec<u8>>,
+    ) -> Result<Self> {
+        let remote = Self {
             endpoint: endpoint.clone(),
-            addr,
-            session: Mutex::new(Some(session)),
-        })
+            addr: ticket.into(),
+            nickname,
+            access: StdMutex::new(Access {
+                token,
+                receiver_nickname: String::new(),
+            }),
+            session: Mutex::new(None),
+        };
+        let session = tokio::time::timeout(CONNECT_TIMEOUT, remote.open_session())
+            .await
+            .std_context("timed out waiting for the receiver")??;
+        *remote.session.lock().await = Some(session);
+        Ok(remote)
     }
 
     /// Binds a loopback endpoint without relays or address lookup, for tests.
@@ -71,6 +134,20 @@ impl Remote {
     /// Returns the id of the receiver this remote talks to.
     pub fn receiver_id(&self) -> EndpointId {
         self.addr.id
+    }
+
+    /// Returns the nickname the receiver reported on the last connection.
+    pub fn receiver_nickname(&self) -> String {
+        self.access
+            .lock()
+            .expect("poisoned")
+            .receiver_nickname
+            .clone()
+    }
+
+    /// Returns the token to present on future connections, if the receiver issued one.
+    pub fn token(&self) -> Option<Vec<u8>> {
+        self.access.lock().expect("poisoned").token.clone()
     }
 
     /// Sends a command and waits for the receiver to acknowledge it.
@@ -99,7 +176,7 @@ impl Remote {
                 }
             }
         }
-        let session = guard.insert(Session::open(&self.endpoint, self.addr.clone()).await?);
+        let session = guard.insert(self.open_session().await?);
         session.send(command).await
     }
 
@@ -115,8 +192,35 @@ impl Remote {
         {
             return Ok(());
         }
-        *guard = Some(Session::open(&self.endpoint, self.addr.clone()).await?);
+        *guard = Some(self.open_session().await?);
         Ok(())
+    }
+
+    /// Connects and runs the handshake, recording what the receiver granted.
+    async fn open_session(&self) -> Result<Session> {
+        let hello = Hello {
+            nickname: self.nickname.clone(),
+            token: self.token(),
+        };
+        let conn = self.endpoint.connect(self.addr.clone(), ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+        write_message(&mut send, &hello).await?;
+        let welcome: Welcome = read_message(&mut recv).await?;
+        let refused = match welcome {
+            Welcome::Granted { nickname, token } => {
+                let mut access = self.access.lock().expect("poisoned");
+                access.receiver_nickname = nickname;
+                if let Some(token) = token {
+                    info!(receiver = %self.addr.id.fmt_short(), "received connect token");
+                    access.token = Some(token);
+                }
+                return Ok(Session { conn, send, recv });
+            }
+            Welcome::Denied => AccessError::Denied,
+            Welcome::Revoked => AccessError::Revoked,
+        };
+        conn.close(0u32.into(), b"bye");
+        Err(AnyError::from_std(refused))
     }
 
     /// Closes the connection to the receiver.
@@ -133,12 +237,6 @@ impl Remote {
 }
 
 impl Session {
-    async fn open(endpoint: &Endpoint, addr: EndpointAddr) -> Result<Self> {
-        let conn = endpoint.connect(addr, ALPN).await?;
-        let (send, recv) = conn.open_bi().await.anyerr()?;
-        Ok(Self { conn, send, recv })
-    }
-
     async fn send(&mut self, command: Command) -> Result<Duration> {
         let start = Instant::now();
         self.send.write_all(&[command.to_byte()]).await.anyerr()?;
