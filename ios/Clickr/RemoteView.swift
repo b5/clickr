@@ -70,10 +70,14 @@ struct RemoteView: View {
         case .connecting: return "Connecting..."
         case .waitingForApproval: return "Waiting for approval on the computer..."
         case .connected:
-            if let rtt = model.lastRoundTripMs {
-                return "Connected - \(rtt) ms"
+            var text = "Connected"
+            if let transport = model.paths?.selected {
+                text += " via \(transport)"
             }
-            return "Connected"
+            if let rtt = model.lastRoundTripMs {
+                text += " - \(rtt) ms"
+            }
+            return text
         case .denied: return "The computer declined this phone"
         case .revoked: return "The computer revoked this phone's access"
         case let .failed(message): return message

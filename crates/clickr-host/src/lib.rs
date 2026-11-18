@@ -6,7 +6,7 @@
 //! going on ([`Host::subscribe`]).
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Debug,
     future::Future,
     path::Path,
@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 
-use clickr_core::{Command, EndpointId, EndpointTicket, Receiver, ReceiverHandler};
+use clickr_core::{Command, EndpointId, EndpointTicket, Paths, Receiver, ReceiverHandler};
 use n0_error::Result;
 use tokio::sync::broadcast;
 use tracing::warn;
@@ -56,6 +56,13 @@ pub enum Event {
         /// The remote's endpoint id.
         id: EndpointId,
     },
+    /// A connected remote's network paths changed; see [`Host::paths`].
+    PathsChanged {
+        /// The remote's endpoint id.
+        id: EndpointId,
+        /// The remote's current paths.
+        paths: Paths,
+    },
     /// A remote pressed a button.
     Pressed {
         /// The remote's endpoint id.
@@ -79,6 +86,7 @@ pub struct Host {
 struct Shared {
     store: Store,
     connected: Mutex<BTreeSet<EndpointId>>,
+    paths: Mutex<BTreeMap<EndpointId, Paths>>,
     events: broadcast::Sender<Event>,
 }
 
@@ -104,6 +112,7 @@ impl Host {
         let shared = Arc::new(Shared {
             store,
             connected: Mutex::default(),
+            paths: Mutex::default(),
             events,
         });
         let handler = Handler {
@@ -139,6 +148,11 @@ impl Host {
     /// Returns the remotes that are connected right now.
     pub fn connected(&self) -> BTreeSet<EndpointId> {
         self.shared.connected.lock().expect("poisoned").clone()
+    }
+
+    /// Returns the latest network paths of each connected remote.
+    pub fn paths(&self) -> BTreeMap<EndpointId, Paths> {
+        self.shared.paths.lock().expect("poisoned").clone()
     }
 
     /// Returns a stream of [`Event`]s from now on.
@@ -233,7 +247,20 @@ impl<A: Approver> ReceiverHandler for Handler<A> {
             .lock()
             .expect("poisoned")
             .remove(&remote);
+        self.shared.paths.lock().expect("poisoned").remove(&remote);
         self.shared.emit(Event::Disconnected { id: remote });
+    }
+
+    fn paths_changed(&self, remote: EndpointId, paths: &Paths) {
+        self.shared
+            .paths
+            .lock()
+            .expect("poisoned")
+            .insert(remote, paths.clone());
+        self.shared.emit(Event::PathsChanged {
+            id: remote,
+            paths: paths.clone(),
+        });
     }
 
     fn handle(&self, remote: EndpointId, command: Command) {

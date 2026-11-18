@@ -111,6 +111,17 @@ button.danger { background: var(--danger); }
 .device-text { flex: 1; min-width: 0; }
 .device-text div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.device-name { display: flex; align-items: center; gap: 6px; }
+.badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  flex: none;
+}
+
 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); flex: none; }
 .dot.online { background: var(--online); }
 .dot.revoked { background: var(--danger); }

@@ -22,6 +22,8 @@ final class RemoteModel: ObservableObject {
     /// The computer the remote screen is showing, if any.
     @Published private(set) var selectedID: String?
     @Published private(set) var lastRoundTripMs: UInt32?
+    /// The current connection's network paths, refreshed every couple of seconds.
+    @Published private(set) var paths: ClickrPaths?
     @Published private(set) var nickname: String
 
     var selected: KnownHost? { selectedID.flatMap { store.host(id: $0) } }
@@ -38,16 +40,33 @@ final class RemoteModel: ObservableObject {
     private let secretKey = DeviceKey.load()
     /// The tail of the queue of in-flight operations; chaining keeps presses in order.
     private var tail: Task<Void, Never>?
+    /// Refreshes `paths`, so a switch to Bluetooth shows up without pressing anything.
+    private var pathsTask: Task<Void, Never>?
     private let impact = UIImpactFeedbackGenerator(style: .medium)
     private let notify = UINotificationFeedbackGenerator()
 
     init() {
         nickname = PhoneProfile.nickname()
         hosts = store.hosts
+        pathsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.refreshPaths()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
         if let id = UserDefaults.standard.string(forKey: Self.openHostKey),
            store.host(id: id) != nil {
             open(id: id)
         }
+    }
+
+    deinit {
+        pathsTask?.cancel()
+    }
+
+    private func refreshPaths() {
+        let current = remote?.paths()
+        if current != paths { paths = current }
     }
 
     // MARK: Known computers
@@ -154,6 +173,7 @@ final class RemoteModel: ObservableObject {
                 let rtt = forward ? try await remote.nextSlide() : try await remote.previousSlide()
                 self.lastRoundTripMs = rtt
                 self.status = .connected
+                self.refreshPaths()
             } catch {
                 self.notify.notificationOccurred(.error)
                 self.fail(error)
@@ -177,6 +197,7 @@ final class RemoteModel: ObservableObject {
             self.remote = remote
             record(remote, for: host)
             status = .connected
+            refreshPaths()
         } catch {
             remote = nil
             fail(error)
@@ -222,6 +243,7 @@ final class RemoteModel: ObservableObject {
     private func disconnect() {
         guard let remote else { return }
         self.remote = nil
+        paths = nil
         Task.detached { await remote.close() }
     }
 

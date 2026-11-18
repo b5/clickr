@@ -16,12 +16,15 @@ use tokio::sync::Mutex;
 use tracing::{debug, info};
 
 use crate::{
-    ACK_OK, ALPN, Command,
+    ACK_OK, ALPN, Command, Paths,
     wire::{Hello, Welcome, read_message, write_message},
 };
 
-/// How long a single command may take, including a reconnect, before it fails.
+/// How long the receiver has to acknowledge a command on a live connection.
 const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long reconnecting may take. Setting up a Bluetooth connection alone takes several
+/// seconds, so this is well above [`SEND_TIMEOUT`].
+const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long [`Remote::connect`] waits, which covers the user approving a new remote on the
 /// receiver.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -73,6 +76,8 @@ pub struct Remote {
 struct Access {
     token: Option<Vec<u8>>,
     receiver_nickname: String,
+    /// The current connection, kept here so [`Remote::paths`] does not wait for a send.
+    conn: Option<Connection>,
 }
 
 #[derive(Debug)]
@@ -112,6 +117,7 @@ impl Remote {
             access: StdMutex::new(Access {
                 token,
                 receiver_nickname: String::new(),
+                conn: None,
             }),
             session: Mutex::new(None),
         };
@@ -145,6 +151,13 @@ impl Remote {
             .clone()
     }
 
+    /// Returns the paths of the current connection, or `None` when not connected.
+    pub fn paths(&self) -> Option<Paths> {
+        let access = self.access.lock().expect("poisoned");
+        let conn = access.conn.as_ref()?;
+        conn.close_reason().is_none().then(|| Paths::of(conn))
+    }
+
     /// Returns the token to present on future connections, if the receiver issued one.
     pub fn token(&self) -> Option<Vec<u8>> {
         self.access.lock().expect("poisoned").token.clone()
@@ -152,32 +165,51 @@ impl Remote {
 
     /// Sends a command and waits for the receiver to acknowledge it.
     ///
-    /// Returns the round-trip time. If the current connection is broken, reconnects once
-    /// and retries.
+    /// Returns the round-trip time. If the current connection is broken, reconnects and
+    /// sends the command again.
+    ///
+    /// If the receiver does not acknowledge within five seconds, the connection is
+    /// dropped and this fails without resending, since the receiver may have handled the
+    /// command and only the acknowledgement is late. The next send reconnects.
     ///
     /// # Errors
     ///
-    /// Returns an error if the command could not be delivered within five seconds.
+    /// Returns an error if the acknowledgement timed out, or if reconnecting failed or
+    /// took longer than 30 seconds.
     pub async fn send(&self, command: Command) -> Result<Duration> {
-        tokio::time::timeout(SEND_TIMEOUT, self.send_inner(command))
-            .await
-            .std_context("timed out")?
-    }
-
-    async fn send_inner(&self, command: Command) -> Result<Duration> {
         let mut guard = self.session.lock().await;
         if let Some(session) = guard.as_mut() {
-            match session.send(command).await {
-                Ok(rtt) => return Ok(rtt),
-                Err(err) => {
+            match tokio::time::timeout(SEND_TIMEOUT, session.send(command)).await {
+                Ok(Ok(rtt)) => return Ok(rtt),
+                Ok(Err(err)) => {
                     debug!("send failed, reconnecting: {err:#}");
-                    session.conn.close(0u32.into(), b"reconnecting");
-                    *guard = None;
+                    self.drop_session(&mut guard);
+                }
+                Err(_) => {
+                    // Keeping a connection that stopped answering would make every later
+                    // command wait on it too. iroh only looks up other paths, such as
+                    // Bluetooth, once the last connection to the receiver is closed.
+                    debug!("receiver did not acknowledge in time, dropping the connection");
+                    self.drop_session(&mut guard);
+                    return Err(anyerr!("timed out waiting for the receiver"));
                 }
             }
         }
-        let session = guard.insert(self.open_session().await?);
-        session.send(command).await
+        let session = tokio::time::timeout(RECONNECT_TIMEOUT, self.open_session())
+            .await
+            .std_context("timed out reconnecting")??;
+        let session = guard.insert(session);
+        tokio::time::timeout(SEND_TIMEOUT, session.send(command))
+            .await
+            .std_context("timed out waiting for the receiver")?
+    }
+
+    /// Closes and forgets the current connection.
+    fn drop_session(&self, session: &mut Option<Session>) {
+        if let Some(session) = session.take() {
+            session.conn.close(0u32.into(), b"reconnecting");
+        }
+        self.access.lock().expect("poisoned").conn = None;
     }
 
     /// Checks that the receiver is reachable, reconnecting if needed.
@@ -192,7 +224,11 @@ impl Remote {
         {
             return Ok(());
         }
-        *guard = Some(self.open_session().await?);
+        self.drop_session(&mut guard);
+        let session = tokio::time::timeout(RECONNECT_TIMEOUT, self.open_session())
+            .await
+            .std_context("timed out reconnecting")??;
+        *guard = Some(session);
         Ok(())
     }
 
@@ -210,6 +246,7 @@ impl Remote {
             Welcome::Granted { nickname, token } => {
                 let mut access = self.access.lock().expect("poisoned");
                 access.receiver_nickname = nickname;
+                access.conn = Some(conn.clone());
                 if let Some(token) = token {
                     info!(receiver = %self.addr.id.fmt_short(), "received connect token");
                     access.token = Some(token);
@@ -233,6 +270,7 @@ impl Remote {
         if let Some(session) = self.session.lock().await.take() {
             session.conn.close(0u32.into(), b"bye");
         }
+        self.access.lock().expect("poisoned").conn = None;
     }
 }
 

@@ -15,10 +15,11 @@ use iroh::{
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{Result, StdResultExt};
+use n0_future::StreamExt;
 use tracing::{debug, info, warn};
 
 use crate::{
-    ACK_OK, ACK_UNKNOWN, ALPN, Command, bind_endpoint,
+    ACK_OK, ACK_UNKNOWN, ALPN, Command, Paths, bind_endpoint,
     capability::{issue_connect, verify_connect},
     wire::{Hello, Welcome, read_message, write_message},
 };
@@ -52,6 +53,14 @@ pub trait ReceiverHandler: Debug + Send + Sync + 'static {
 
     /// Called when the last connection from a remote closed.
     fn disconnected(&self, remote: EndpointId);
+
+    /// Called when a remote's connection opened or closed a path, or switched paths.
+    ///
+    /// The first call comes right after [`connected`]. With several connections from one
+    /// remote, calls from each are interleaved.
+    ///
+    /// [`connected`]: Self::connected
+    fn paths_changed(&self, remote: EndpointId, paths: &Paths);
 
     /// Handles a single command from a connected remote.
     fn handle(&self, remote: EndpointId, command: Command);
@@ -183,7 +192,11 @@ impl<H: ReceiverHandler> Handler<H> {
             .or_default()
             .push(connection.clone());
         self.handler.connected(remote, &hello.nickname);
-        let res = serve(&mut send, &mut recv, &*self.handler, remote).await;
+        // The path watch ends when the connection closes, which also ends `serve`.
+        let res = tokio::select! {
+            res = serve(&mut send, &mut recv, &*self.handler, remote) => res,
+            () = watch_paths(connection, &*self.handler, remote) => Ok(()),
+        };
         if self.remove_live(remote, connection) {
             info!(remote = %remote.fmt_short(), "remote disconnected");
             self.handler.disconnected(remote);
@@ -235,6 +248,22 @@ impl<H: ReceiverHandler> Handler<H> {
             true
         } else {
             false
+        }
+    }
+}
+
+/// Reports `connection`'s paths to the handler whenever they change.
+async fn watch_paths(connection: &Connection, handler: &impl ReceiverHandler, remote: EndpointId) {
+    let mut last = None;
+    let mut stream = connection.paths_stream();
+    while stream.next().await.is_some() {
+        // Snapshots also arrive for changes that look the same here, such as a new
+        // relay path replacing an old one; only report what the user can see.
+        let paths = Paths::of(connection);
+        if last.as_ref() != Some(&paths) {
+            debug!(remote = %remote.fmt_short(), %paths, "paths changed");
+            handler.paths_changed(remote, &paths);
+            last = Some(paths);
         }
     }
 }

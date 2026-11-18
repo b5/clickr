@@ -32,6 +32,7 @@ use n0_error::{Result, StdResultExt};
 
 mod capability;
 mod endpoint;
+mod paths;
 mod receiver;
 mod remote;
 mod wire;
@@ -39,6 +40,7 @@ mod wire;
 pub use self::{
     capability::Cap,
     endpoint::bind_endpoint,
+    paths::{Paths, Transport},
     receiver::{Receiver, ReceiverHandler},
     remote::{AccessError, Remote},
 };
@@ -108,7 +110,11 @@ mod tests {
         prompts: AtomicUsize,
         revoked: Mutex<BTreeSet<EndpointId>>,
         connected: Mutex<BTreeMap<EndpointId, String>>,
+        connections: AtomicUsize,
+        paths: Mutex<Option<Paths>>,
         seen: Mutex<Vec<Command>>,
+        /// Makes the next command block the handler this long, like a stuck receiver.
+        stall: Mutex<Option<Duration>>,
     }
 
     impl Recorder {
@@ -118,7 +124,10 @@ mod tests {
                 prompts: AtomicUsize::new(0),
                 revoked: Mutex::default(),
                 connected: Mutex::default(),
+                connections: AtomicUsize::new(0),
+                paths: Mutex::default(),
                 seen: Mutex::default(),
+                stall: Mutex::default(),
             })
         }
 
@@ -142,6 +151,7 @@ mod tests {
         }
 
         fn connected(&self, remote: EndpointId, nickname: &str) {
+            self.connections.fetch_add(1, Ordering::SeqCst);
             self.connected
                 .lock()
                 .unwrap()
@@ -152,8 +162,16 @@ mod tests {
             self.connected.lock().unwrap().remove(&remote);
         }
 
+        fn paths_changed(&self, _remote: EndpointId, paths: &Paths) {
+            *self.paths.lock().unwrap() = Some(paths.clone());
+        }
+
         fn handle(&self, _remote: EndpointId, command: Command) {
             self.seen.lock().unwrap().push(command);
+            let stall = self.stall.lock().unwrap().take();
+            if let Some(stall) = stall {
+                std::thread::sleep(stall);
+            }
         }
     }
 
@@ -361,6 +379,67 @@ mod tests {
         })
         .await
         .std_context("disconnect not reported")?;
+
+        endpoint.close().await;
+        receiver.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_sides_see_the_transport() -> Result<()> {
+        let recorder = Recorder::new(true);
+        let receiver = Receiver::spawn_local(SecretKey::generate(), recorder.clone()).await?;
+        let endpoint = Remote::bind_local().await?;
+        let remote = connect(&endpoint, &receiver, None).await?;
+        remote.send(Command::Next).await?;
+
+        assert_eq!(
+            remote.paths().and_then(|p| p.selected),
+            Some(Transport::Ipv4)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while recorder
+                .paths
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|p| p.selected)
+                != Some(Transport::Ipv4)
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .std_context("receiver did not report the path")?;
+
+        remote.close().await;
+        assert_eq!(remote.paths(), None);
+        endpoint.close().await;
+        receiver.shutdown().await;
+        Ok(())
+    }
+
+    /// A receiver that stops answering must not wedge the remote: the timed-out send
+    /// drops the connection, and the next send reconnects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ack_timeout_drops_connection_and_next_send_reconnects() -> Result<()> {
+        let recorder = Recorder::new(true);
+        let receiver = Receiver::spawn_local(SecretKey::generate(), recorder.clone()).await?;
+        let endpoint = Remote::bind_local().await?;
+        let remote = connect(&endpoint, &receiver, None).await?;
+        assert_eq!(recorder.connections.load(Ordering::SeqCst), 1);
+
+        *recorder.stall.lock().unwrap() = Some(Duration::from_secs(6));
+        assert!(remote.send(Command::Next).await.is_err());
+        assert_eq!(remote.paths(), None);
+
+        remote.send(Command::Previous).await?;
+        assert_eq!(recorder.connections.load(Ordering::SeqCst), 2);
+        // The timed-out command reached the receiver once and was not resent.
+        assert_eq!(
+            *recorder.seen.lock().unwrap(),
+            vec![Command::Next, Command::Previous]
+        );
 
         endpoint.close().await;
         receiver.shutdown().await;

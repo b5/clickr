@@ -136,6 +136,9 @@ fn print_event(host: &Host, event: &Event) {
         Event::Pressed { id, command } => {
             println!("{} {command:?}", display_name(&host.snapshot(), id));
         }
+        Event::PathsChanged { id, paths } => {
+            println!("{} {paths}", display_name(&host.snapshot(), id));
+        }
         Event::StateChanged => {}
     }
 }

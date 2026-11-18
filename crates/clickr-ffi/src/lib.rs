@@ -117,6 +117,28 @@ pub fn short_endpoint_id(id: String) -> String {
         .map_or(id, |id| id.fmt_short().to_string())
 }
 
+/// The network paths of a connection, for display.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ClickrPaths {
+    /// The path in use: "Bluetooth", "IPv4", "IPv6" or "relay". `None` while no path is
+    /// selected.
+    pub selected: Option<String>,
+    /// The other open paths, ready to take over.
+    pub standby: Vec<String>,
+    /// Both of the above in one line, like "via IPv4 (also Bluetooth)".
+    pub summary: String,
+}
+
+impl From<clickr_core::Paths> for ClickrPaths {
+    fn from(paths: clickr_core::Paths) -> Self {
+        Self {
+            selected: paths.selected.map(|t| t.to_string()),
+            standby: paths.standby().map(|t| t.to_string()).collect(),
+            summary: paths.to_string(),
+        }
+    }
+}
+
 /// The phone's iroh endpoint, reaching receivers over the internet and Bluetooth.
 ///
 /// Bind one node when the app starts and keep it for the life of the process: the
@@ -187,6 +209,13 @@ impl ClickrRemote {
     /// Returns a short form of the receiver's endpoint id, for display.
     pub fn receiver_short_id(&self) -> String {
         self.inner.receiver_id().fmt_short().to_string()
+    }
+
+    /// Returns the current connection's network paths, or `None` when not connected.
+    ///
+    /// Reads local state only, so it is cheap to poll.
+    pub fn paths(&self) -> Option<ClickrPaths> {
+        self.inner.paths().map(ClickrPaths::from)
     }
 
     /// Returns the nickname the receiver reported.

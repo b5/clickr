@@ -1,11 +1,15 @@
 //! The Clickr Mac app: a receiver with a window.
 //!
 //! Shows the pairing code (hidden by default, since the screen is usually being
-//! presented), asks before letting a new phone in, and lists known and revoked phones.
+//! presented), asks before letting a new remote in, and lists known and revoked remotes
+//! with the network path each connected remote uses.
 
-use std::{collections::BTreeSet, rc::Rc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    rc::Rc,
+};
 
-use clickr_core::{Command, EndpointId};
+use clickr_core::{Command, EndpointId, Paths};
 use clickr_host::{Approver, Event, Host, HostState, KnownDevice, Revocation, ago, config_dir};
 use dioxus::{
     desktop::{Config, LogicalSize, WindowBuilder},
@@ -29,7 +33,7 @@ fn main() {
         .launch(App);
 }
 
-/// A phone waiting for the user to allow or deny it.
+/// A remote waiting for the user to allow or deny it.
 #[derive(Debug)]
 struct Request {
     id: EndpointId,
@@ -58,13 +62,25 @@ impl Approver for WindowApprover {
     }
 }
 
+/// What the window shows, mirrored from the [`Host`].
+#[derive(Clone, Copy, PartialEq)]
+struct Live {
+    state: Signal<HostState>,
+    connected: Signal<BTreeSet<EndpointId>>,
+    paths: Signal<BTreeMap<EndpointId, Paths>>,
+    requests: Signal<Vec<Request>>,
+    last_press: Signal<Option<(EndpointId, Command)>>,
+}
+
 /// Starts the host and keeps the signals in sync with it until the window closes.
-async fn run_host(
-    mut state: Signal<HostState>,
-    mut connected: Signal<BTreeSet<EndpointId>>,
-    mut requests: Signal<Vec<Request>>,
-    mut last_press: Signal<Option<(EndpointId, Command)>>,
-) -> Result<Rc<Host>, String> {
+async fn run_host(live: Live) -> Result<Rc<Host>, String> {
+    let Live {
+        mut state,
+        mut connected,
+        mut paths,
+        mut requests,
+        mut last_press,
+    } = live;
     let (tx, mut rx) = mpsc::channel(PENDING_REQUESTS);
     let dir = config_dir().map_err(|err| format!("{err:#}"))?;
     let host = Host::start(&dir, WindowApprover { requests: tx })
@@ -87,11 +103,16 @@ async fn run_host(
                 Ok(Event::StateChanged) => state.set(watched.snapshot()),
                 Ok(Event::Connected { .. } | Event::Disconnected { .. }) => {
                     connected.set(watched.connected());
+                    paths.set(watched.paths());
+                }
+                Ok(Event::PathsChanged { id, paths: changed }) => {
+                    paths.write().insert(id, changed);
                 }
                 Ok(Event::Pressed { id, command }) => last_press.set(Some((id, command))),
                 Err(RecvError::Lagged(_)) => {
                     state.set(watched.snapshot());
                     connected.set(watched.connected());
+                    paths.set(watched.paths());
                 }
                 Err(RecvError::Closed) => break,
             }
@@ -102,11 +123,14 @@ async fn run_host(
 
 #[component]
 fn App() -> Element {
-    let state = use_signal(HostState::default);
-    let connected = use_signal(BTreeSet::new);
-    let requests = use_signal(Vec::<Request>::new);
-    let last_press = use_signal(|| None);
-    let mut host = use_resource(move || run_host(state, connected, requests, last_press));
+    let live = Live {
+        state: use_signal(HostState::default),
+        connected: use_signal(BTreeSet::new),
+        paths: use_signal(BTreeMap::new),
+        requests: use_signal(Vec::new),
+        last_press: use_signal(|| None),
+    };
+    let mut host = use_resource(move || run_host(live));
 
     let body = match &*host.read() {
         None => rsx! { p { class: "muted center", "Starting..." } },
@@ -118,13 +142,7 @@ fn App() -> Element {
             }
         },
         Some(Ok(host)) => rsx! {
-            Main {
-                host: HostHandle(host.clone()),
-                state,
-                connected,
-                requests,
-                last_press,
-            }
+            Main { host: HostHandle(host.clone()), live }
         },
     };
     rsx! {
@@ -144,16 +162,11 @@ impl PartialEq for HostHandle {
 }
 
 #[component]
-fn Main(
-    host: HostHandle,
-    state: Signal<HostState>,
-    connected: Signal<BTreeSet<EndpointId>>,
-    requests: Signal<Vec<Request>>,
-    last_press: Signal<Option<(EndpointId, Command)>>,
-) -> Element {
-    let snapshot = state.read().clone();
-    let online = connected.read().clone();
-    let press = last_press().map(|(id, command)| {
+fn Main(host: HostHandle, live: Live) -> Element {
+    let snapshot = live.state.read().clone();
+    let online = live.connected.read().clone();
+    let paths = live.paths.read().clone();
+    let press = (live.last_press)().map(|(id, command)| {
         let name = snapshot
             .known
             .get(&id)
@@ -169,9 +182,9 @@ fn Main(
         Nickname { host: host.clone(), nickname: snapshot.nickname.clone() }
         PairingCode { host: host.clone() }
         section { class: "card",
-            h2 { "Phones" }
+            h2 { "Remotes" }
             if snapshot.known.is_empty() {
-                p { class: "muted", "No phones yet. Show the pairing code and scan it with the Clickr app." }
+                p { class: "muted", "No remotes yet. Show the pairing code and scan it with the Clickr app." }
             }
             for (id, device) in snapshot.known.clone() {
                 DeviceRow {
@@ -180,6 +193,7 @@ fn Main(
                     id,
                     device,
                     online: online.contains(&id),
+                    paths: paths.get(&id).cloned(),
                 }
             }
             if let Some(press) = press {
@@ -189,13 +203,13 @@ fn Main(
         if !snapshot.revoked.is_empty() {
             section { class: "card",
                 h2 { "Revoked" }
-                p { class: "muted", "These phones are turned away until you remove the revocation." }
+                p { class: "muted", "These remotes are turned away until you remove the revocation." }
                 for (id, revocation) in snapshot.revoked.clone() {
                     RevokedRow { key: "{id}", host: host.clone(), id, revocation }
                 }
             }
         }
-        ApprovalPrompt { requests }
+        ApprovalPrompt { requests: live.requests }
     }
 }
 
@@ -251,7 +265,7 @@ fn Nickname(host: HostHandle, nickname: String) -> Element {
             } else {
                 div {
                     h1 { "{nickname}" }
-                    p { class: "muted", "Phones see this computer by this name." }
+                    p { class: "muted", "Remotes see this computer by this name." }
                 }
                 button {
                     class: "secondary",
@@ -327,20 +341,36 @@ fn PairingCode(host: HostHandle) -> Element {
 }
 
 #[component]
-fn DeviceRow(host: HostHandle, id: EndpointId, device: KnownDevice, online: bool) -> Element {
+fn DeviceRow(
+    host: HostHandle,
+    id: EndpointId,
+    device: KnownDevice,
+    online: bool,
+    paths: Option<Paths>,
+) -> Element {
     let mut confirming = use_signal(|| false);
     let mut error = use_signal(|| None::<String>);
-    let status = if online {
-        "Connected".to_string()
-    } else {
-        format!("Last seen {}", ago(device.last_seen))
+    let status = match (&paths, online) {
+        (Some(paths), true) => format!("Connected {paths}"),
+        (None, true) => "Connected".to_string(),
+        (_, false) => format!("Last seen {}", ago(device.last_seen)),
     };
+    let badge = paths
+        .as_ref()
+        .filter(|_| online)
+        .and_then(|paths| paths.selected)
+        .map(|transport| transport.to_string());
 
     rsx! {
         div { class: "device",
             span { class: if online { "dot online" } else { "dot" } }
             div { class: "device-text",
-                div { "{device.nickname}" }
+                div { class: "device-name",
+                    span { "{device.nickname}" }
+                    if let Some(badge) = badge {
+                        span { class: "badge", "{badge}" }
+                    }
+                }
                 div { class: "muted small", span { class: "mono", "{id.fmt_short()}" } " - {status}" }
                 if let Some(err) = error() {
                     div { class: "error-text small", "{err}" }
@@ -369,7 +399,7 @@ fn DeviceRow(host: HostHandle, id: EndpointId, device: KnownDevice, online: bool
 fn RevokedRow(host: HostHandle, id: EndpointId, revocation: Revocation) -> Element {
     let mut error = use_signal(|| None::<String>);
     let name = if revocation.nickname.is_empty() {
-        "Unknown phone".to_string()
+        "Unknown remote".to_string()
     } else {
         revocation.nickname.clone()
     };
@@ -400,10 +430,10 @@ fn RevokedRow(host: HostHandle, id: EndpointId, revocation: Revocation) -> Eleme
     }
 }
 
-/// Asks about the oldest waiting phone, one at a time.
+/// Asks about the oldest waiting remote, one at a time.
 #[component]
 fn ApprovalPrompt(requests: Signal<Vec<Request>>) -> Element {
-    // A phone that gave up waiting closes its side of the reply channel. Skip those
+    // A remote that gave up waiting closes its side of the reply channel. Skip those
     // here and prune them when answering: writing the signal while rendering it would
     // re-render forever.
     let current = requests
@@ -428,7 +458,7 @@ fn ApprovalPrompt(requests: Signal<Vec<Request>>) -> Element {
             div { class: "dialog",
                 h2 { "{nickname} wants to connect" }
                 p { class: "muted",
-                    "Phone "
+                    "Remote "
                     span { class: "mono", "{id.fmt_short()}" }
                     ". Allowing it gives it a token, so it can connect without asking again until you revoke it."
                 }
