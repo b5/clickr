@@ -18,6 +18,9 @@ final class RemoteModel: ObservableObject {
 
     private static let ticketKey = "pairingTicket"
 
+    /// The app's single endpoint, bound on first use and kept for the life of the process.
+    /// Its Bluetooth transport can't be shut down, so it must never be bound twice.
+    private var node: ClickrNode?
     private var remote: ClickrRemote?
     /// This install's identity; the same key is used for every connection.
     private let secretKey = DeviceKey.load()
@@ -120,13 +123,23 @@ final class RemoteModel: ObservableObject {
     private func establish(ticket: String) async {
         status = .connecting
         do {
-            let remote = try await ClickrRemote.connect(ticket: ticket, secretKey: secretKey)
+            let node = try await boundNode()
+            let remote = try await node.connect(ticket: ticket)
             self.remote = remote
             status = .connected(receiver: remote.receiverName())
         } catch {
             remote = nil
             status = .failed(Self.describe(error))
         }
+    }
+
+    /// Returns the app's node, binding it on first use. Only called from queued operations,
+    /// so two binds can't race.
+    private func boundNode() async throws -> ClickrNode {
+        if let node { return node }
+        let node = try await ClickrNode.bind(secretKey: secretKey)
+        self.node = node
+        return node
     }
 
     private func disconnect() {

@@ -3,15 +3,15 @@
 use std::{fmt::Debug, future::Future, sync::Arc};
 
 use iroh::{
-    Endpoint, EndpointId, SecretKey,
-    endpoint::{Connection, presets},
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
+    endpoint::Connection,
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{Result, StdResultExt};
 use tracing::{debug, info, warn};
 
-use crate::{ACK_OK, ACK_UNKNOWN, ALPN, Command};
+use crate::{ACK_OK, ACK_UNKNOWN, ALPN, Command, bind_endpoint};
 
 /// Application callbacks invoked by a [`Receiver`].
 pub trait CommandHandler: Debug + Send + Sync + 'static {
@@ -34,13 +34,11 @@ pub struct Receiver {
 impl Receiver {
     /// Binds an endpoint with the given identity and starts accepting remotes.
     ///
-    /// The endpoint uses the n0 relays and address lookup, so a ticket stays usable across
-    /// network changes as long as the secret key stays the same.
+    /// The endpoint is set up by [`bind_endpoint`]: it uses the n0 relays and address
+    /// lookup, so a ticket stays usable across network changes as long as the secret key
+    /// stays the same, and accepts remotes over Bluetooth when available.
     pub async fn spawn(secret_key: SecretKey, handler: impl CommandHandler) -> Result<Self> {
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await?;
+        let endpoint = bind_endpoint(secret_key).await?;
         Ok(Self::with_endpoint(endpoint, handler))
     }
 
@@ -50,7 +48,7 @@ impl Receiver {
         secret_key: SecretKey,
         handler: impl CommandHandler,
     ) -> Result<Self> {
-        let endpoint = Endpoint::builder(presets::Minimal)
+        let endpoint = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .secret_key(secret_key)
             .bind_addr("127.0.0.1:0")?
             .bind()
@@ -71,8 +69,17 @@ impl Receiver {
     }
 
     /// Returns a pairing ticket containing the current addresses of this receiver.
+    ///
+    /// Custom transport addresses are left out: the Bluetooth transport reports a local
+    /// placeholder that means nothing to other devices, which find this receiver over
+    /// Bluetooth by its endpoint id instead.
     pub fn ticket(&self) -> EndpointTicket {
-        EndpointTicket::new(self.endpoint().addr())
+        let addr = self.endpoint().addr();
+        let addrs = addr
+            .addrs
+            .into_iter()
+            .filter(|addr| !matches!(addr, TransportAddr::Custom(_)));
+        EndpointTicket::new(EndpointAddr::from_parts(addr.id, addrs))
     }
 
     /// Stops accepting connections and closes the endpoint gracefully.

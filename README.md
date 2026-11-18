@@ -40,6 +40,21 @@ only pairs once. Delete `secret.key` there to get a new identity, or edit
 On macOS, key presses need the Accessibility permission: System Settings, Privacy &
 Security, Accessibility, then enable your terminal app.
 
+## Bluetooth
+
+Besides the internet, the phone and computer reach each other over Bluetooth Low
+Energy using [iroh-ble-transport](https://github.com/mcginty/iroh-ble-transport), so
+clickr works when the two aren't on the same network or there is no network at all.
+iroh picks the best path on its own; nothing needs to be configured.
+
+- The first launch on each side asks for Bluetooth access. On macOS the permission
+  goes to your terminal app (System Settings, Privacy & Security, Bluetooth).
+- If Bluetooth is off or access was denied, clickr logs a warning and uses the
+  internet only. Turning Bluetooth on later takes effect after restarting `clickr
+  accept` or the app.
+- The phone and computer find each other over Bluetooth by endpoint id, so existing
+  pairing tickets keep working.
+
 ## iPhone
 
 Requires Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen) and the iOS Rust
@@ -63,6 +78,11 @@ Access) and triple-click the side button while Clickr is open.
 ALPN `n0/clickr/0`. The phone opens one bidirectional stream per connection and
 writes one byte per press (`0x01` previous, `0x02` next). The computer answers each
 byte with `0x00` (ok) or `0xFF` (unknown command). The phone reconnects on failure.
+
+## License
+
+clickr is licensed under the [GNU Affero General Public License v3.0 or
+later](LICENSE), matching its Bluetooth dependencies.
 
 ## Notes
 

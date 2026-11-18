@@ -1,11 +1,11 @@
 //! Swift bindings for [`clickr_core`], generated with uniffi.
 //!
-//! The iOS app only needs the [`Remote`] half of the protocol, exposed here as
-//! [`ClickrRemote`].
+//! The iOS app only needs the [`Remote`] half of the protocol. It binds one
+//! [`ClickrNode`] for its lifetime and connects a [`ClickrRemote`] through it.
 
 use std::{fmt, sync::Arc};
 
-use clickr_core::{Command, Remote, SecretKey};
+use clickr_core::{Command, Endpoint, Remote, SecretKey};
 use tracing_subscriber::filter::LevelFilter;
 
 uniffi::setup_scaffolding!();
@@ -74,7 +74,7 @@ pub fn init_logging(level: LogLevel) {
 
 /// Generates a new 32-byte secret key identifying this phone to receivers.
 ///
-/// Store it and pass it to every [`ClickrRemote::connect`] call, so receivers that trusted
+/// Store it and pass it to [`ClickrNode::bind`] on every launch, so receivers that trusted
 /// this phone once keep trusting it.
 #[uniffi::export]
 pub fn generate_secret_key() -> Vec<u8> {
@@ -87,6 +87,41 @@ pub fn is_valid_ticket(ticket: String) -> bool {
     clickr_core::parse_ticket(&ticket).is_ok()
 }
 
+/// The phone's iroh endpoint, reaching receivers over the internet and Bluetooth.
+///
+/// Bind one node when the app starts and keep it for the life of the process: the
+/// Bluetooth transport keeps running until the process exits, so binding a node per
+/// connection would leave several running at once.
+#[derive(Debug, uniffi::Object)]
+pub struct ClickrNode {
+    endpoint: Endpoint,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl ClickrNode {
+    /// Binds the endpoint, identifying as `secret_key` (see [`generate_secret_key`]).
+    #[uniffi::constructor]
+    pub async fn bind(secret_key: Vec<u8>) -> Result<Arc<Self>, ClickrError> {
+        let bytes: [u8; 32] = secret_key.as_slice().try_into().map_err(|_| {
+            ClickrError::InvalidSecretKey(format!("expected 32 bytes, got {}", secret_key.len()))
+        })?;
+        let endpoint = clickr_core::bind_endpoint(SecretKey::from_bytes(&bytes))
+            .await
+            .map_err(conn_err)?;
+        Ok(Arc::new(Self { endpoint }))
+    }
+
+    /// Connects to the receiver named by a pairing ticket.
+    pub async fn connect(&self, ticket: String) -> Result<Arc<ClickrRemote>, ClickrError> {
+        let ticket = clickr_core::parse_ticket(&ticket)
+            .map_err(|err| ClickrError::InvalidTicket(format!("{err:#}")))?;
+        let inner = Remote::connect(&self.endpoint, ticket)
+            .await
+            .map_err(conn_err)?;
+        Ok(Arc::new(ClickrRemote { inner }))
+    }
+}
+
 /// A connection from the phone to a `clickr accept` receiver.
 #[derive(Debug, uniffi::Object)]
 pub struct ClickrRemote {
@@ -95,21 +130,6 @@ pub struct ClickrRemote {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl ClickrRemote {
-    /// Connects to the receiver named by a pairing ticket, identifying as `secret_key`
-    /// (see [`generate_secret_key`]).
-    #[uniffi::constructor]
-    pub async fn connect(ticket: String, secret_key: Vec<u8>) -> Result<Arc<Self>, ClickrError> {
-        let ticket = clickr_core::parse_ticket(&ticket)
-            .map_err(|err| ClickrError::InvalidTicket(format!("{err:#}")))?;
-        let bytes: [u8; 32] = secret_key.as_slice().try_into().map_err(|_| {
-            ClickrError::InvalidSecretKey(format!("expected 32 bytes, got {}", secret_key.len()))
-        })?;
-        let inner = Remote::connect(ticket, SecretKey::from_bytes(&bytes))
-            .await
-            .map_err(conn_err)?;
-        Ok(Arc::new(Self { inner }))
-    }
-
     /// Sends a right arrow press. Returns the round-trip time in milliseconds.
     pub async fn next_slide(&self) -> Result<u32, ClickrError> {
         self.send(Command::Next).await
@@ -130,7 +150,7 @@ impl ClickrRemote {
         self.inner.receiver_id().fmt_short().to_string()
     }
 
-    /// Closes the connection and releases network resources.
+    /// Closes the connection. The node's endpoint stays open for later connections.
     pub async fn close(&self) {
         self.inner.close().await;
     }

@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey,
-    endpoint::{Connection, RecvStream, SendStream, presets},
+    Endpoint, EndpointAddr, EndpointId,
+    endpoint::{Connection, RecvStream, SendStream},
 };
 use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{Result, StdResultExt, anyerr};
@@ -21,7 +21,11 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(5);
 /// The connection is re-established transparently when a send fails, so a remote
 /// survives the receiver restarting or the phone switching networks.
 ///
+/// A remote borrows its [`Endpoint`] rather than owning it: bind one endpoint per process
+/// with [`bind_endpoint`] and create a remote per receiver from it.
+///
 /// [`Receiver`]: crate::Receiver
+/// [`bind_endpoint`]: crate::bind_endpoint
 #[derive(Debug)]
 pub struct Remote {
     endpoint: Endpoint,
@@ -37,41 +41,31 @@ struct Session {
 }
 
 impl Remote {
-    /// Binds an endpoint with the given identity and connects to the receiver named by
-    /// `ticket`.
+    /// Connects to the receiver named by `ticket` from `endpoint`.
     ///
-    /// Reuse the same `secret_key` across connections: receivers trust remotes by
-    /// endpoint id, so a fresh key looks like a new, untrusted phone.
+    /// Receivers trust remotes by endpoint id, so bind `endpoint` with the same secret key
+    /// every time; a fresh key looks like a new, untrusted phone.
     ///
     /// # Errors
     ///
-    /// Returns an error if the endpoint cannot bind or the receiver is unreachable.
-    pub async fn connect(ticket: EndpointTicket, secret_key: SecretKey) -> Result<Self> {
-        let endpoint = Endpoint::builder(presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await?;
-        Self::with_endpoint(endpoint, ticket).await
-    }
-
-    /// Connects over loopback without relays or address lookup, for tests.
-    #[cfg(test)]
-    pub(crate) async fn connect_local(ticket: EndpointTicket) -> Result<Self> {
-        let endpoint = Endpoint::builder(presets::Minimal)
-            .bind_addr("127.0.0.1:0")?
-            .bind()
-            .await?;
-        Self::with_endpoint(endpoint, ticket).await
-    }
-
-    async fn with_endpoint(endpoint: Endpoint, ticket: EndpointTicket) -> Result<Self> {
+    /// Returns an error if the receiver is unreachable.
+    pub async fn connect(endpoint: &Endpoint, ticket: EndpointTicket) -> Result<Self> {
         let addr: EndpointAddr = ticket.into();
-        let session = Session::open(&endpoint, addr.clone()).await?;
+        let session = Session::open(endpoint, addr.clone()).await?;
         Ok(Self {
-            endpoint,
+            endpoint: endpoint.clone(),
             addr,
             session: Mutex::new(Some(session)),
         })
+    }
+
+    /// Binds a loopback endpoint without relays or address lookup, for tests.
+    #[cfg(test)]
+    pub(crate) async fn bind_local() -> Result<Endpoint> {
+        Ok(Endpoint::builder(iroh::endpoint::presets::Minimal)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?)
     }
 
     /// Returns the id of the receiver this remote talks to.
@@ -125,12 +119,16 @@ impl Remote {
         Ok(())
     }
 
-    /// Closes the connection and the endpoint.
+    /// Closes the connection to the receiver.
+    ///
+    /// The endpoint stays open. A later [`send`] or [`ensure_connected`] reconnects.
+    ///
+    /// [`send`]: Self::send
+    /// [`ensure_connected`]: Self::ensure_connected
     pub async fn close(&self) {
         if let Some(session) = self.session.lock().await.take() {
             session.conn.close(0u32.into(), b"bye");
         }
-        self.endpoint.close().await;
     }
 }
 

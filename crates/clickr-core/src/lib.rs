@@ -8,6 +8,9 @@
 //! - A [`Remote`] runs on the phone. It dials the receiver from a ticket and sends
 //!   commands over a single long-lived bidirectional stream.
 //!
+//! Both roles bind their endpoint with [`bind_endpoint`], which connects over the internet
+//! and, when available, Bluetooth Low Energy.
+//!
 //! # Wire protocol
 //!
 //! The remote opens one bidirectional stream per connection. Each command is one byte
@@ -16,14 +19,16 @@
 
 use std::str::FromStr;
 
-pub use iroh::{EndpointId, SecretKey};
+pub use iroh::{Endpoint, EndpointId, SecretKey};
 pub use iroh_tickets::endpoint::EndpointTicket;
 use n0_error::{Result, StdResultExt};
 
+mod endpoint;
 mod receiver;
 mod remote;
 
 pub use self::{
+    endpoint::bind_endpoint,
     receiver::{CommandHandler, Receiver},
     remote::Remote,
 };
@@ -108,7 +113,8 @@ mod tests {
         let recorder = Arc::new(Recorder::default());
         let receiver = Receiver::spawn_local(SecretKey::generate(), recorder.clone()).await?;
         let ticket = receiver.ticket();
-        let remote = Remote::connect_local(ticket).await?;
+        let endpoint = Remote::bind_local().await?;
+        let remote = Remote::connect(&endpoint, ticket).await?;
 
         remote.send(Command::Next).await?;
         remote.send(Command::Next).await?;
@@ -119,6 +125,7 @@ mod tests {
         );
 
         remote.close().await;
+        endpoint.close().await;
         receiver.shutdown().await;
         Ok(())
     }
@@ -132,10 +139,12 @@ mod tests {
         let receiver = Receiver::spawn(SecretKey::generate(), recorder.clone()).await?;
         receiver.endpoint().online().await;
         let ticket = parse_ticket(&receiver.ticket().to_string())?;
-        let remote = Remote::connect(ticket, SecretKey::generate()).await?;
+        let endpoint = bind_endpoint(SecretKey::generate()).await?;
+        let remote = Remote::connect(&endpoint, ticket).await?;
         remote.send(Command::Next).await?;
         assert_eq!(*recorder.seen.lock().unwrap(), vec![Command::Next]);
         remote.close().await;
+        endpoint.close().await;
         receiver.shutdown().await;
         Ok(())
     }
@@ -147,7 +156,8 @@ mod tests {
             ..Default::default()
         });
         let receiver = Receiver::spawn_local(SecretKey::generate(), recorder.clone()).await?;
-        let res = Remote::connect_local(receiver.ticket()).await;
+        let endpoint = Remote::bind_local().await?;
+        let res = Remote::connect(&endpoint, receiver.ticket()).await;
         // The connection may be closed before or after the handshake completes, so
         // either connecting or the first send fails.
         let failed = match res {
@@ -156,6 +166,7 @@ mod tests {
         };
         assert!(failed);
         assert!(recorder.seen.lock().unwrap().is_empty());
+        endpoint.close().await;
         receiver.shutdown().await;
         Ok(())
     }
