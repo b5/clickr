@@ -2,22 +2,38 @@ import ClickrKit
 import Foundation
 import UIKit
 
-/// Owns the connection to the computer and the saved pairing ticket.
+/// Owns the known computers, the phone's nickname, and the connection to the selected
+/// computer.
 @MainActor
 final class RemoteModel: ObservableObject {
     enum Status: Equatable {
         case idle
         case connecting
-        case connected(receiver: String)
+        /// Connecting without a token, so the computer is asking its user.
+        case waitingForApproval
+        case connected
+        case denied
+        case revoked
         case failed(String)
     }
 
     @Published private(set) var status: Status = .idle
-    @Published private(set) var ticket: String?
+    @Published private(set) var hosts: [KnownHost] = []
+    /// The computer the remote screen is showing, if any.
+    @Published private(set) var selectedID: String?
     @Published private(set) var lastRoundTripMs: UInt32?
+    /// The current connection's network paths, refreshed every couple of seconds.
+    @Published private(set) var paths: ClickrPaths?
+    /// What this phone's Bluetooth transport knows about the selected computer.
+    @Published private(set) var bluetoothStatus: String?
+    @Published private(set) var nickname: String
 
-    private static let ticketKey = "pairingTicket"
+    var selected: KnownHost? { selectedID.flatMap { store.host(id: $0) } }
 
+    /// Remembers which computer was open, so relaunching returns to it.
+    private static let openHostKey = "openHostID"
+
+    private var store = KnownHosts.load()
     /// The app's single endpoint, bound on first use and kept for the life of the process.
     /// Its Bluetooth transport can't be shut down, so it must never be bound twice.
     private var node: ClickrNode?
@@ -26,48 +42,96 @@ final class RemoteModel: ObservableObject {
     private let secretKey = DeviceKey.load()
     /// The tail of the queue of in-flight operations; chaining keeps presses in order.
     private var tail: Task<Void, Never>?
+    /// Refreshes `paths`, so a switch to Bluetooth shows up without pressing anything.
+    private var pathsTask: Task<Void, Never>?
     private let impact = UIImpactFeedbackGenerator(style: .medium)
     private let notify = UINotificationFeedbackGenerator()
 
     init() {
-        ticket = UserDefaults.standard.string(forKey: Self.ticketKey)
-        if ticket != nil {
-            connect()
+        nickname = PhoneProfile.nickname()
+        hosts = store.hosts
+        pathsTask = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.refreshPaths()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        if let id = UserDefaults.standard.string(forKey: Self.openHostKey),
+           store.host(id: id) != nil {
+            open(id: id)
         }
     }
 
-    /// Saves a ticket and connects to it. Returns false if the ticket is malformed.
+    deinit {
+        pathsTask?.cancel()
+    }
+
+    private func refreshPaths() {
+        let current = remote?.paths()
+        if current != paths { paths = current }
+        let bluetooth = selectedID.flatMap { id in node?.bluetoothStatus(peerId: id) }
+        if bluetooth != bluetoothStatus { bluetoothStatus = bluetooth }
+    }
+
+    // MARK: Known computers
+
+    /// Saves the computer named by a ticket and opens it. Returns false if the ticket is
+    /// malformed.
     @discardableResult
     func pair(with rawTicket: String) -> Bool {
         let trimmed = rawTicket.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isValidTicket(ticket: trimmed) else { return false }
-        ticket = trimmed
-        UserDefaults.standard.set(trimmed, forKey: Self.ticketKey)
-        disconnect()
-        connect()
+        guard isValidTicket(ticket: trimmed), let host = store.add(ticket: trimmed) else {
+            return false
+        }
+        hosts = store.hosts
+        open(id: host.id)
         return true
     }
 
-    /// Forgets the saved computer.
-    func unpair() {
+    /// Shows the remote for a known computer and connects to it.
+    func open(id: String) {
+        selectedID = id
+        UserDefaults.standard.set(id, forKey: Self.openHostKey)
+        lastRoundTripMs = nil
+        connect()
+    }
+
+    /// Returns to the list of computers, closing the connection.
+    func close() {
         disconnect()
-        ticket = nil
-        UserDefaults.standard.removeObject(forKey: Self.ticketKey)
+        selectedID = nil
+        UserDefaults.standard.removeObject(forKey: Self.openHostKey)
         status = .idle
     }
 
-    /// Connects to the paired computer, closing any existing connection first.
+    /// Forgets a computer, including its token.
+    func forget(id: String) {
+        if selectedID == id { close() }
+        store.forget(id: id)
+        hosts = store.hosts
+    }
+
+    func setNickname(_ newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        PhoneProfile.setNickname(trimmed)
+        nickname = trimmed
+    }
+
+    // MARK: Connection
+
+    /// Connects to the selected computer, closing any existing connection first.
     func connect() {
-        guard let ticket else { return }
+        guard selectedID != nil else { return }
         enqueue { [weak self] in
             guard let self else { return }
             // Close inside the queue so overlapping reconnects can't leave a connection
-            // open, and wait for it so two endpoints with the same key never overlap.
+            // open.
             if let old = self.remote {
                 self.remote = nil
                 await old.close()
             }
-            await self.establish(ticket: ticket)
+            await self.establish()
         }
     }
 
@@ -77,18 +141,18 @@ final class RemoteModel: ObservableObject {
     /// Called when the app returns to the foreground; connections usually die while
     /// iOS has the app suspended.
     func resume() {
-        guard ticket != nil else { return }
+        guard selectedID != nil else { return }
         enqueue { [weak self] in
-            guard let self, let ticket = self.ticket else { return }
+            guard let self else { return }
             if let remote = self.remote {
                 do {
                     try await remote.ensureConnected()
-                    self.status = .connected(receiver: remote.receiverName())
+                    self.status = .connected
                 } catch {
-                    self.status = .failed(Self.describe(error))
+                    self.fail(error)
                 }
             } else {
-                await self.establish(ticket: ticket)
+                await self.establish()
             }
         }
     }
@@ -102,8 +166,8 @@ final class RemoteModel: ObservableObject {
         impact.impactOccurred()
         enqueue { [weak self] in
             guard let self else { return }
-            if self.remote == nil, let ticket = self.ticket {
-                await self.establish(ticket: ticket)
+            if self.remote == nil {
+                await self.establish()
             }
             guard let remote = self.remote else {
                 self.notify.notificationOccurred(.error)
@@ -112,24 +176,62 @@ final class RemoteModel: ObservableObject {
             do {
                 let rtt = forward ? try await remote.nextSlide() : try await remote.previousSlide()
                 self.lastRoundTripMs = rtt
-                self.status = .connected(receiver: remote.receiverName())
+                self.status = .connected
+                self.refreshPaths()
             } catch {
                 self.notify.notificationOccurred(.error)
-                self.status = .failed(Self.describe(error))
+                self.fail(error)
             }
         }
     }
 
-    private func establish(ticket: String) async {
-        status = .connecting
+    private func establish() async {
+        guard let host = selected else { return }
+        status = host.token == nil ? .waitingForApproval : .connecting
         do {
             let node = try await boundNode()
-            let remote = try await node.connect(ticket: ticket)
+            let remote = try await node.connect(
+                ticket: host.ticket, nickname: nickname, token: host.token
+            )
+            // The user may have closed or switched computers while this was connecting.
+            guard selectedID == host.id else {
+                await remote.close()
+                return
+            }
             self.remote = remote
-            status = .connected(receiver: remote.receiverName())
+            record(remote, for: host)
+            status = .connected
+            refreshPaths()
         } catch {
             remote = nil
-            status = .failed(Self.describe(error))
+            fail(error)
+        }
+    }
+
+    /// Saves the nickname and token the computer sent.
+    private func record(_ remote: ClickrRemote, for host: KnownHost) {
+        var updated = host
+        updated.nickname = remote.receiverNickname()
+        if let token = remote.token() {
+            updated.token = token
+        }
+        updated.lastUsed = Date()
+        store.update(updated)
+        hosts = store.hosts
+    }
+
+    private func fail(_ error: Error) {
+        switch error {
+        case ClickrError.Denied:
+            status = .denied
+        case ClickrError.Revoked:
+            status = .revoked
+        case let ClickrError.InvalidTicket(message),
+             let ClickrError.InvalidSecretKey(message),
+             let ClickrError.Connection(message):
+            status = .failed(message)
+        default:
+            status = .failed(error.localizedDescription)
         }
     }
 
@@ -145,6 +247,7 @@ final class RemoteModel: ObservableObject {
     private func disconnect() {
         guard let remote else { return }
         self.remote = nil
+        paths = nil
         Task.detached { await remote.close() }
     }
 
@@ -153,17 +256,6 @@ final class RemoteModel: ObservableObject {
         tail = Task { @MainActor in
             await previous?.value
             await op()
-        }
-    }
-
-    private static func describe(_ error: Error) -> String {
-        switch error {
-        case let ClickrError.InvalidTicket(message),
-             let ClickrError.InvalidSecretKey(message),
-             let ClickrError.Connection(message):
-            return message
-        default:
-            return error.localizedDescription
         }
     }
 }

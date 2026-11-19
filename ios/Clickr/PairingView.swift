@@ -1,8 +1,9 @@
 import SwiftUI
 
-/// Pairs with a computer by scanning or pasting the ticket from `clickr accept`.
+/// Pairs with a computer by scanning or pasting its ticket. Shown as a sheet.
 struct PairingView: View {
     @EnvironmentObject private var model: RemoteModel
+    @Environment(\.dismiss) private var dismiss
     @State private var pasted = ""
     @State private var invalid = false
     @State private var scanning = false
@@ -11,7 +12,7 @@ struct PairingView: View {
         NavigationStack {
             Form {
                 Section {
-                    Text("Run `clickr accept` on your computer, then scan the code it prints.")
+                    Text("Open Clickr on your Mac and show the pairing code, or run `clickr accept`, then scan the code.")
                     Button {
                         scanning = true
                     } label: {
@@ -28,7 +29,13 @@ struct PairingView: View {
                         .disabled(pasted.isEmpty)
                 }
             }
-            .navigationTitle("Pair Clickr")
+            .navigationTitle("Pair computer")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
             .sheet(isPresented: $scanning) {
                 QRScannerView { code in
                     scanning = false
@@ -43,7 +50,9 @@ struct PairingView: View {
     }
 
     private func submit(_ text: String) {
-        if !model.pair(with: text) {
+        if model.pair(with: text) {
+            dismiss()
+        } else {
             invalid = true
         }
     }
