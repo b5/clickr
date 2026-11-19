@@ -4,6 +4,7 @@ import SwiftUI
 struct RemoteView: View {
     @EnvironmentObject private var model: RemoteModel
     @State private var confirmUnpair = false
+    @State private var showDetails = false
 
     var body: some View {
         VStack(spacing: 16) {
@@ -19,25 +20,46 @@ struct RemoteView: View {
             .layoutPriority(1)
         }
         .padding()
+        .sheet(isPresented: $showDetails) {
+            ConnectionDetailsView()
+        }
         .confirmationDialog("Forget this computer?", isPresented: $confirmUnpair) {
-            Button("Forget", role: .destructive) { model.unpair() }
+            Button("Forget", role: .destructive) {
+                if let id = model.selectedID { model.forget(id: id) }
+            }
+        } message: {
+            Text("You'll need to pair and be approved again to use it.")
         }
     }
 
     private var header: some View {
         HStack {
+            Button {
+                model.close()
+            } label: {
+                Image(systemName: "chevron.left")
+                    .imageScale(.large)
+            }
+            .accessibilityLabel("Computers")
             Circle()
                 .fill(statusColor)
                 .frame(width: 10, height: 10)
-            Text(statusText)
-                .font(.subheadline)
-                .lineLimit(1)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(model.selected?.nickname ?? "")
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(statusText)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer()
-            if case .failed = model.status {
+            if canRetry {
                 Button("Retry") { model.connect() }
                     .buttonStyle(.bordered)
             }
             Menu {
+                Button("Connection details") { showDetails = true }
                 Button("Reconnect") { model.connect() }
                 Button("Forget computer", role: .destructive) { confirmUnpair = true }
             } label: {
@@ -51,21 +73,35 @@ struct RemoteView: View {
         switch model.status {
         case .idle: return "Not connected"
         case .connecting: return "Connecting..."
-        case let .connected(receiver):
-            if let rtt = model.lastRoundTripMs {
-                return "\(receiver) - \(rtt) ms"
+        case .waitingForApproval: return "Waiting for approval on the computer..."
+        case .connected:
+            var text = "Connected"
+            if let transport = model.paths?.selected {
+                text += " via \(transport)"
             }
-            return "Connected to \(receiver)"
+            if let rtt = model.lastRoundTripMs {
+                text += " - \(rtt) ms"
+            }
+            return text
+        case .denied: return "The computer declined this phone"
+        case .revoked: return "The computer revoked this phone's access"
         case let .failed(message): return message
+        }
+    }
+
+    private var canRetry: Bool {
+        switch model.status {
+        case .denied, .revoked, .failed: return true
+        default: return false
         }
     }
 
     private var statusColor: Color {
         switch model.status {
         case .idle: return .gray
-        case .connecting: return .yellow
+        case .connecting, .waitingForApproval: return .yellow
         case .connected: return .green
-        case .failed: return .red
+        case .denied, .revoked, .failed: return .red
         }
     }
 }

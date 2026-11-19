@@ -1,22 +1,17 @@
 //! Command line receiver for the clickr presentation remote.
 //!
 //! `clickr accept` prints a pairing ticket, waits for phones to connect, and turns their
-//! button presses into left and right arrow key presses for whatever app has focus.
+//! button presses into left and right arrow key presses for whatever app has focus. The
+//! other subcommands manage known phones and revocations.
 
-use std::{
-    collections::BTreeSet,
-    fs,
-    io::{BufRead, Write},
-    path::{Path, PathBuf},
-    sync::{Mutex, mpsc},
-    time::Duration,
-};
+use std::io::{BufRead, Write};
 
 use clap::{Parser, Subcommand};
-use clickr_core::{Command, CommandHandler, EndpointId, Receiver, SecretKey};
+use clickr_core::EndpointId;
+use clickr_host::{Approver, Event, Host, HostState, Store, ago, config_dir, default_nickname};
 use n0_error::{Result, StdResultExt, anyerr};
 use qrcode::{QrCode, render::unicode};
-use tracing::warn;
+use tokio::sync::broadcast::error::RecvError;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -29,9 +24,27 @@ struct Cli {
 enum Cmd {
     /// Prints a pairing ticket and turns remote presses into arrow key presses.
     Accept {
-        /// Trusts every phone that connects without asking.
+        /// Allows every new phone without asking.
         #[arg(long, short)]
         yes: bool,
+    },
+    /// Lists known and revoked phones.
+    Devices,
+    /// Revokes a phone, turning it away until unrevoked. Stop `accept` first.
+    Revoke {
+        /// The phone's endpoint id, or a unique prefix of it.
+        id: String,
+    },
+    /// Removes a revocation, so the phone's existing token works again. Stop `accept`
+    /// first.
+    Unrevoke {
+        /// The phone's endpoint id, or a unique prefix of it.
+        id: String,
+    },
+    /// Shows or sets the nickname phones see for this computer. Stop `accept` first.
+    Name {
+        /// The new nickname. Omit to print the current one.
+        nickname: Option<String>,
     },
 }
 
@@ -40,39 +53,45 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "clickr=info,clickr_core=info".into()),
+                .unwrap_or_else(|_| "clickr=info,clickr_core=info,clickr_host=info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
 
     match Cli::parse().command {
         Cmd::Accept { yes } => accept(yes).await,
+        Cmd::Devices => {
+            print_devices(&open_store()?.snapshot());
+            Ok(())
+        }
+        Cmd::Revoke { id } => {
+            let store = open_store()?;
+            let id = find_id(&store.snapshot(), &id)?;
+            store.revoke(id)?;
+            println!("Revoked {}.", id.fmt_short());
+            Ok(())
+        }
+        Cmd::Unrevoke { id } => {
+            let store = open_store()?;
+            let id = find_id(&store.snapshot(), &id)?;
+            store.unrevoke(&id)?;
+            println!("Removed the revocation of {}.", id.fmt_short());
+            Ok(())
+        }
+        Cmd::Name { nickname: None } => {
+            println!("{}", open_store()?.nickname());
+            Ok(())
+        }
+        Cmd::Name {
+            nickname: Some(nickname),
+        } => open_store()?.set_nickname(nickname),
     }
 }
 
-async fn accept(trust_all: bool) -> Result<()> {
-    let dir = config_dir()?;
-    let secret_key = load_or_create_key(&dir.join("secret.key"))?;
-    let trusted = Trusted::load(dir.join("trusted.txt"))?;
-    let keys = Keyboard::spawn()?;
-    let handler = Handler {
-        trusted,
-        trust_all,
-        keys,
-        prompt: tokio::sync::Mutex::new(()),
-    };
+async fn accept(allow_all: bool) -> Result<()> {
+    let host = Host::start(&config_dir()?, TerminalApprover::new(allow_all)).await?;
 
-    let receiver = Receiver::spawn(secret_key, handler).await?;
-    // Wait briefly for a relay connection so the ticket carries a relay URL. The ticket
-    // works without it on the local network, so do not block forever when offline.
-    if tokio::time::timeout(Duration::from_secs(5), receiver.endpoint().online())
-        .await
-        .is_err()
-    {
-        warn!("no relay connection yet, ticket only contains local addresses");
-    }
-
-    let ticket = receiver.ticket().to_string();
+    let ticket = host.ticket().to_string();
     let qr = QrCode::new(ticket.as_bytes()).std_context("failed to encode QR code")?;
     let image = qr
         .render::<unicode::Dense1x2>()
@@ -81,184 +100,148 @@ async fn accept(trust_all: bool) -> Result<()> {
         .quiet_zone(true)
         .build();
     println!("{image}");
-    println!("Scan the code with the Clickr app, or paste this ticket:\n\n{ticket}\n");
+    println!(
+        "{} is ready. Scan the code with the Clickr app, or paste this ticket:\n\n{ticket}\n",
+        host.snapshot().nickname
+    );
     println!("Waiting for remotes. Press Ctrl-C to stop.");
 
-    tokio::signal::ctrl_c().await.anyerr()?;
+    let mut events = host.subscribe();
+    loop {
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                res.anyerr()?;
+                break;
+            }
+            event = events.recv() => match event {
+                Ok(event) => print_event(&host, &event),
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+        }
+    }
     println!("\nShutting down.");
-    receiver.shutdown().await;
+    host.shutdown().await;
     Ok(())
 }
 
+fn print_event(host: &Host, event: &Event) {
+    match event {
+        Event::Connected { id, nickname } => {
+            println!("{nickname} ({}) connected", id.fmt_short());
+        }
+        Event::Disconnected { id } => {
+            println!("{} disconnected", display_name(&host.snapshot(), id));
+        }
+        Event::Pressed { id, command } => {
+            println!("{} {command:?}", display_name(&host.snapshot(), id));
+        }
+        Event::PathsChanged { id, paths } => {
+            println!("{} {paths}", display_name(&host.snapshot(), id));
+        }
+        Event::StateChanged => {}
+    }
+}
+
+/// Asks on the terminal, or allows everyone with `--yes`.
 #[derive(Debug)]
-struct Handler {
-    trusted: Trusted,
-    trust_all: bool,
-    keys: Keyboard,
-    /// Serializes interactive prompts so two phones never ask at the same time.
+struct TerminalApprover {
+    allow_all: bool,
+    /// Serializes prompts so two phones never ask at the same time.
     prompt: tokio::sync::Mutex<()>,
 }
 
-impl CommandHandler for Handler {
-    async fn authorize(&self, remote: EndpointId) -> bool {
-        if self.trusted.contains(&remote) {
+impl TerminalApprover {
+    fn new(allow_all: bool) -> Self {
+        Self {
+            allow_all,
+            prompt: tokio::sync::Mutex::new(()),
+        }
+    }
+}
+
+impl Approver for TerminalApprover {
+    async fn approve(&self, id: EndpointId, nickname: &str) -> bool {
+        if self.allow_all {
+            println!("Allowing {nickname} ({}).", id.fmt_short());
             return true;
         }
-        let ok = if self.trust_all {
-            true
-        } else {
-            let _guard = self.prompt.lock().await;
-            ask_trust(remote).await
-        };
-        if ok && let Err(err) = self.trusted.insert(remote) {
-            warn!("failed to save trusted remote: {err:#}");
-        }
-        ok
-    }
-
-    fn handle(&self, remote: EndpointId, command: Command) {
-        println!("{} {:?}", remote.fmt_short(), command);
-        self.keys.press(command);
-    }
-}
-
-async fn ask_trust(remote: EndpointId) -> bool {
-    tokio::task::spawn_blocking(move || {
-        print!("Remote {} wants to connect. Trust it? [y/N] ", remote.fmt_short());
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        if std::io::stdin().lock().read_line(&mut line).is_err() {
-            return false;
-        }
-        matches!(line.trim(), "y" | "Y" | "yes")
-    })
-    .await
-    .unwrap_or(false)
-}
-
-/// Sends key presses from a dedicated thread, since the platform input handle is not
-/// `Send` on every OS.
-#[derive(Debug)]
-struct Keyboard {
-    tx: mpsc::Sender<Command>,
-}
-
-impl Keyboard {
-    fn spawn() -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<Command>();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
-        std::thread::Builder::new()
-            .name("clickr-keys".into())
-            .spawn(move || {
-                use enigo::{Direction, Enigo, Key, Keyboard as _, Settings};
-                let mut enigo = match Enigo::new(&Settings::default()) {
-                    Ok(enigo) => {
-                        ready_tx.send(Ok(())).ok();
-                        enigo
-                    }
-                    Err(err) => {
-                        let hint = if cfg!(target_os = "macos") {
-                            "\n\nGrant your terminal app access in System Settings > \
-                             Privacy & Security > Accessibility, then run clickr again."
-                        } else {
-                            ""
-                        };
-                        ready_tx
-                            .send(Err(anyerr!("cannot simulate key presses: {err}{hint}")))
-                            .ok();
-                        return;
-                    }
-                };
-                for command in rx {
-                    let key = match command {
-                        Command::Previous => Key::LeftArrow,
-                        Command::Next => Key::RightArrow,
-                    };
-                    if let Err(err) = enigo.key(key, Direction::Click) {
-                        warn!("failed to send key: {err}");
-                    }
-                }
-            })
-            .std_context("failed to spawn keyboard thread")?;
-        ready_rx.recv().std_context("keyboard thread died")??;
-        Ok(Self { tx })
-    }
-
-    fn press(&self, command: Command) {
-        self.tx.send(command).ok();
-    }
-}
-
-/// The set of remotes allowed to connect without a prompt, persisted one id per line.
-#[derive(Debug)]
-struct Trusted {
-    path: PathBuf,
-    ids: Mutex<BTreeSet<EndpointId>>,
-}
-
-impl Trusted {
-    fn load(path: PathBuf) -> Result<Self> {
-        let mut ids = BTreeSet::new();
-        if path.exists() {
-            let text = fs::read_to_string(&path).std_context("failed to read trusted remotes")?;
-            for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                match line.parse() {
-                    Ok(id) => {
-                        ids.insert(id);
-                    }
-                    Err(err) => warn!("ignoring invalid trusted remote {line:?}: {err}"),
-                }
+        let _guard = self.prompt.lock().await;
+        let question = format!(
+            "{nickname} ({}) wants to connect. Allow? [y/N] ",
+            id.fmt_short()
+        );
+        tokio::task::spawn_blocking(move || {
+            print!("{question}");
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            if std::io::stdin().lock().read_line(&mut line).is_err() {
+                return false;
             }
-        }
-        Ok(Self {
-            path,
-            ids: Mutex::new(ids),
+            matches!(line.trim(), "y" | "Y" | "yes")
         })
-    }
-
-    fn contains(&self, id: &EndpointId) -> bool {
-        self.ids.lock().expect("poisoned").contains(id)
-    }
-
-    fn insert(&self, id: EndpointId) -> Result<()> {
-        let mut ids = self.ids.lock().expect("poisoned");
-        ids.insert(id);
-        let text: String = ids.iter().map(|id| format!("{id}\n")).collect();
-        fs::write(&self.path, text).std_context("failed to write trusted remotes")
+        .await
+        .unwrap_or(false)
     }
 }
 
-fn config_dir() -> Result<PathBuf> {
-    let dir = dirs::config_dir()
-        .ok_or_else(|| anyerr!("no config directory on this platform"))?
-        .join("clickr");
-    fs::create_dir_all(&dir).std_context("failed to create config directory")?;
-    Ok(dir)
+fn open_store() -> Result<Store> {
+    Store::open(&config_dir()?, default_nickname)
 }
 
-/// Loads the receiver identity, creating it on first run.
-///
-/// A stable identity keeps tickets valid across restarts, so a phone only pairs once.
-fn load_or_create_key(path: &Path) -> Result<SecretKey> {
-    if let Ok(bytes) = fs::read(path) {
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyerr!("corrupt secret key at {}", path.display()))?;
-        return Ok(SecretKey::from_bytes(&bytes));
+fn print_devices(state: &HostState) {
+    if state.known.is_empty() && state.revoked.is_empty() {
+        println!("No phones yet. Run `clickr accept` to pair one.");
+        return;
     }
-    let key = SecretKey::generate();
-    write_private(path, &key.to_bytes())?;
-    Ok(key)
+    if !state.known.is_empty() {
+        println!("Known phones:");
+        for (id, device) in &state.known {
+            println!(
+                "  {}  {}  last seen {}",
+                id.fmt_short(),
+                device.nickname,
+                ago(device.last_seen)
+            );
+        }
+    }
+    if !state.revoked.is_empty() {
+        println!("Revoked phones:");
+        for (id, revocation) in &state.revoked {
+            println!(
+                "  {}  {}  revoked {}",
+                id.fmt_short(),
+                revocation.nickname,
+                ago(revocation.revoked_at)
+            );
+        }
+    }
 }
 
-fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let mut file = opts
-        .open(path)
-        .std_context("failed to create secret key file")?;
-    file.write_all(bytes)
-        .std_context("failed to write secret key")
+/// Resolves a full endpoint id or a unique prefix among known and revoked phones.
+fn find_id(state: &HostState, query: &str) -> Result<EndpointId> {
+    if let Ok(id) = query.parse() {
+        return Ok(id);
+    }
+    let matches: Vec<EndpointId> = state
+        .known
+        .keys()
+        .chain(state.revoked.keys())
+        .filter(|id| id.to_string().starts_with(query))
+        .copied()
+        .collect();
+    match matches.as_slice() {
+        [id] => Ok(*id),
+        [] => Err(anyerr!("no known or revoked phone matches {query:?}")),
+        _ => Err(anyerr!(
+            "{query:?} matches several phones, use more characters"
+        )),
+    }
+}
+
+fn display_name(state: &HostState, id: &EndpointId) -> String {
+    match state.known.get(id) {
+        Some(device) => format!("{} ({})", device.nickname, id.fmt_short()),
+        None => id.fmt_short().to_string(),
+    }
 }

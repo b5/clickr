@@ -1,0 +1,16 @@
+[application]
+name = "Clickr"
+
+[bundle]
+identifier = "computer.n0.clickr.host"
+publisher = "n0"
+category = "Productivity"
+short_description = "Turns your iPhone into a presentation remote"
+
+# dx 0.7.10's macOS bundler ignores [permissions] and uses this file as the whole
+# Info.plist rather than merging it, so it carries every key, including the Bluetooth
+# usage string without which macOS kills the app on its first Bluetooth call. Keep the
+# version in sync with Cargo.toml.
+[bundle.macos]
+minimum_system_version = "13.0"
+info_plist_path = "Info.plist"

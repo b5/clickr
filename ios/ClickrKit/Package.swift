@@ -15,6 +15,7 @@ let package = Package(
             name: "ClickrKit",
             dependencies: ["ClickrFFI"],
             linkerSettings: [
+                .linkedFramework("CoreBluetooth"),
                 .linkedFramework("Security"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedLibrary("resolv"),

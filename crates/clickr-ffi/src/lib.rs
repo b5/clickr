@@ -1,11 +1,12 @@
 //! Swift bindings for [`clickr_core`], generated with uniffi.
 //!
-//! The iOS app only needs the [`Remote`] half of the protocol, exposed here as
-//! [`ClickrRemote`].
+//! The iOS app only needs the [`Remote`] half of the protocol. It binds one
+//! [`ClickrNode`] for its lifetime and connects a [`ClickrRemote`] through it.
 
 use std::{fmt, sync::Arc};
 
-use clickr_core::{Command, Remote, SecretKey};
+use clickr_core::{AccessError, Bluetooth, Command, Endpoint, EndpointId, Remote, SecretKey};
+use n0_error::AnyError;
 use tracing_subscriber::filter::LevelFilter;
 
 uniffi::setup_scaffolding!();
@@ -18,6 +19,10 @@ pub enum ClickrError {
     InvalidTicket(String),
     /// The secret key is not 32 bytes long.
     InvalidSecretKey(String),
+    /// The user on the receiver declined this phone.
+    Denied(String),
+    /// The receiver revoked this phone's access.
+    Revoked(String),
     /// The receiver could not be reached or dropped the connection.
     Connection(String),
 }
@@ -27,15 +32,25 @@ impl fmt::Display for ClickrError {
         match self {
             ClickrError::InvalidTicket(msg) => write!(f, "invalid ticket: {msg}"),
             ClickrError::InvalidSecretKey(msg) => write!(f, "invalid secret key: {msg}"),
-            ClickrError::Connection(msg) => write!(f, "{msg}"),
+            ClickrError::Denied(msg) | ClickrError::Revoked(msg) | ClickrError::Connection(msg) => {
+                write!(f, "{msg}")
+            }
         }
     }
 }
 
 impl std::error::Error for ClickrError {}
 
-fn conn_err(err: impl fmt::Display) -> ClickrError {
-    ClickrError::Connection(format!("{err:#}"))
+fn conn_err(err: AnyError) -> ClickrError {
+    match err.downcast_ref::<AccessError>() {
+        Some(AccessError::Denied) => ClickrError::Denied(err.to_string()),
+        Some(AccessError::Revoked) => ClickrError::Revoked(err.to_string()),
+        None => ClickrError::Connection(format!("{err:#}")),
+    }
+}
+
+fn parse_ticket(ticket: &str) -> Result<clickr_core::EndpointTicket, ClickrError> {
+    clickr_core::parse_ticket(ticket).map_err(|err| ClickrError::InvalidTicket(format!("{err:#}")))
 }
 
 /// The most verbose level of log output to emit.
@@ -74,7 +89,7 @@ pub fn init_logging(level: LogLevel) {
 
 /// Generates a new 32-byte secret key identifying this phone to receivers.
 ///
-/// Store it and pass it to every [`ClickrRemote::connect`] call, so receivers that trusted
+/// Store it and pass it to [`ClickrNode::bind`] on every launch, so receivers that trusted
 /// this phone once keep trusting it.
 #[uniffi::export]
 pub fn generate_secret_key() -> Vec<u8> {
@@ -87,7 +102,107 @@ pub fn is_valid_ticket(ticket: String) -> bool {
     clickr_core::parse_ticket(&ticket).is_ok()
 }
 
-/// A connection from the phone to a `clickr accept` receiver.
+/// Returns the endpoint id of the receiver named by `ticket`, which identifies it across
+/// tickets with different addresses.
+#[uniffi::export]
+pub fn ticket_endpoint_id(ticket: String) -> Result<String, ClickrError> {
+    Ok(parse_ticket(&ticket)?.endpoint_addr().id.to_string())
+}
+
+/// Returns the short form of an endpoint id, for display, or `id` itself if it does not
+/// parse.
+#[uniffi::export]
+pub fn short_endpoint_id(id: String) -> String {
+    id.parse::<EndpointId>()
+        .map_or(id, |id| id.fmt_short().to_string())
+}
+
+/// The network paths of a connection, for display.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ClickrPaths {
+    /// The path in use: "Bluetooth", "IPv4", "IPv6" or "relay". `None` while no path is
+    /// selected.
+    pub selected: Option<String>,
+    /// The other open paths, ready to take over.
+    pub standby: Vec<String>,
+    /// Both of the above in one line, like "via IPv4 (also Bluetooth)".
+    pub summary: String,
+    /// The round-trip time of the selected path in milliseconds, as estimated by QUIC.
+    pub rtt_ms: Option<u32>,
+}
+
+impl From<clickr_core::Link> for ClickrPaths {
+    fn from(link: clickr_core::Link) -> Self {
+        let paths = link.paths;
+        Self {
+            selected: paths.selected.map(|t| t.to_string()),
+            standby: paths.standby().map(|t| t.to_string()).collect(),
+            summary: paths.to_string(),
+            rtt_ms: link
+                .rtt
+                .map(|rtt| u32::try_from(rtt.as_millis()).unwrap_or(u32::MAX)),
+        }
+    }
+}
+
+/// The phone's iroh endpoint, reaching receivers over the internet and Bluetooth.
+///
+/// Bind one node when the app starts and keep it for the life of the process: the
+/// Bluetooth transport keeps running until the process exits, so binding a node per
+/// connection would leave several running at once.
+#[derive(Debug, uniffi::Object)]
+pub struct ClickrNode {
+    endpoint: Endpoint,
+    bluetooth: Bluetooth,
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl ClickrNode {
+    /// Binds the endpoint, identifying as `secret_key` (see [`generate_secret_key`]).
+    #[uniffi::constructor]
+    pub async fn bind(secret_key: Vec<u8>) -> Result<Arc<Self>, ClickrError> {
+        let bytes: [u8; 32] = secret_key.as_slice().try_into().map_err(|_| {
+            ClickrError::InvalidSecretKey(format!("expected 32 bytes, got {}", secret_key.len()))
+        })?;
+        let (endpoint, bluetooth) = clickr_core::bind_endpoint(SecretKey::from_bytes(&bytes))
+            .await
+            .map_err(conn_err)?;
+        Ok(Arc::new(Self {
+            endpoint,
+            bluetooth,
+        }))
+    }
+
+    /// Describes what this phone's Bluetooth transport knows about the computer with
+    /// endpoint id `peer_id`, like "on, other device seen, link connected over L2CAP".
+    pub fn bluetooth_status(&self, peer_id: String) -> String {
+        match peer_id.parse::<EndpointId>() {
+            Ok(peer) => self.bluetooth.status(peer).to_string(),
+            Err(err) => format!("invalid endpoint id: {err}"),
+        }
+    }
+
+    /// Connects to the receiver named by a pairing ticket, introducing this phone as
+    /// `nickname`.
+    ///
+    /// Pass the token from [`ClickrRemote::token`] of an earlier connection, if any.
+    /// Without a valid token the receiver asks its user first, and this waits up to two
+    /// minutes for the answer.
+    pub async fn connect(
+        &self,
+        ticket: String,
+        nickname: String,
+        token: Option<Vec<u8>>,
+    ) -> Result<Arc<ClickrRemote>, ClickrError> {
+        let ticket = parse_ticket(&ticket)?;
+        let inner = Remote::connect(&self.endpoint, ticket, nickname, token)
+            .await
+            .map_err(conn_err)?;
+        Ok(Arc::new(ClickrRemote { inner }))
+    }
+}
+
+/// A connection from the phone to a receiver.
 #[derive(Debug, uniffi::Object)]
 pub struct ClickrRemote {
     inner: Remote,
@@ -95,21 +210,6 @@ pub struct ClickrRemote {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl ClickrRemote {
-    /// Connects to the receiver named by a pairing ticket, identifying as `secret_key`
-    /// (see [`generate_secret_key`]).
-    #[uniffi::constructor]
-    pub async fn connect(ticket: String, secret_key: Vec<u8>) -> Result<Arc<Self>, ClickrError> {
-        let ticket = clickr_core::parse_ticket(&ticket)
-            .map_err(|err| ClickrError::InvalidTicket(format!("{err:#}")))?;
-        let bytes: [u8; 32] = secret_key.as_slice().try_into().map_err(|_| {
-            ClickrError::InvalidSecretKey(format!("expected 32 bytes, got {}", secret_key.len()))
-        })?;
-        let inner = Remote::connect(ticket, SecretKey::from_bytes(&bytes))
-            .await
-            .map_err(conn_err)?;
-        Ok(Arc::new(Self { inner }))
-    }
-
     /// Sends a right arrow press. Returns the round-trip time in milliseconds.
     pub async fn next_slide(&self) -> Result<u32, ClickrError> {
         self.send(Command::Next).await
@@ -126,11 +226,30 @@ impl ClickrRemote {
     }
 
     /// Returns a short form of the receiver's endpoint id, for display.
-    pub fn receiver_name(&self) -> String {
+    pub fn receiver_short_id(&self) -> String {
         self.inner.receiver_id().fmt_short().to_string()
     }
 
-    /// Closes the connection and releases network resources.
+    /// Returns the current connection's network paths and latency, or `None` when not
+    /// connected.
+    ///
+    /// Reads local state only, so it is cheap to poll.
+    pub fn paths(&self) -> Option<ClickrPaths> {
+        self.inner.link().map(ClickrPaths::from)
+    }
+
+    /// Returns the nickname the receiver reported.
+    pub fn receiver_nickname(&self) -> String {
+        self.inner.receiver_nickname()
+    }
+
+    /// Returns the `CONNECT` token to store and pass to the next
+    /// [`ClickrNode::connect`], if the receiver issued one.
+    pub fn token(&self) -> Option<Vec<u8>> {
+        self.inner.token()
+    }
+
+    /// Closes the connection. The node's endpoint stays open for later connections.
     pub async fn close(&self) {
         self.inner.close().await;
     }
